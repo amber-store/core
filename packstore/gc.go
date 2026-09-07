@@ -12,8 +12,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/key"
 )
 
 // ErrUnknownSegment reports an id that names no sealed segment (never

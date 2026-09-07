@@ -6,9 +6,9 @@ import (
 	"slices"
 	"time"
 
-	"github.com/jobs-build/amber-store-core/fstree"
-	"github.com/jobs-build/amber-store-core/key"
-	"github.com/jobs-build/amber-store-core/reference"
+	"github.com/amber-store/core/fstree"
+	"github.com/amber-store/core/key"
+	"github.com/amber-store/core/reference"
 )
 
 // PackStatus is one sealed pack's score against a mark.

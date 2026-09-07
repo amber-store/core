@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/jobs-build/amber-store-core/tarexport"
+	"github.com/amber-store/core/tarexport"
 	"github.com/urfave/cli/v2"
 )
 

@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"os"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/key"
 )
 
 // activeLoc locates one record inside the active segment.

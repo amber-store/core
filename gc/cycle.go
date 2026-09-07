@@ -11,7 +11,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/jobs-build/amber-store-core/packstore"
+	"github.com/amber-store/core/packstore"
 )
 
 // ErrCycleRunning reports an overlapping Run; cycles never overlap.

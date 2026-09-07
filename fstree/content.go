@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/key"
 )
 
 // WriteContent writes the regular-file content addressed by k to w, descending

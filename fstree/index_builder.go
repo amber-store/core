@@ -3,8 +3,8 @@ package fstree
 import (
 	"errors"
 
-	"github.com/jobs-build/amber-store-core/chunkers"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/chunkers"
+	"github.com/amber-store/core/key"
 )
 
 // IndexBuilder builds the index levels above a leaf level by streaming child

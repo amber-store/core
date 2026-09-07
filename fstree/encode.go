@@ -3,9 +3,9 @@ package fstree
 import (
 	"fmt"
 
+	"github.com/amber-store/core/cborx"
+	"github.com/amber-store/core/key"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/jobs-build/amber-store-core/cborx"
-	"github.com/jobs-build/amber-store-core/key"
 )
 
 // encMode is the RFC 8949 section 4.2 core-deterministic CBOR encoder shared by

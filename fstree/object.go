@@ -4,7 +4,7 @@
 // streaming. See architecture/types.md for the length-field semantics.
 package fstree
 
-import "github.com/jobs-build/amber-store-core/key"
+import "github.com/amber-store/core/key"
 
 // Object is a built CAS object: its key and its serialized bytes.
 type Object struct {

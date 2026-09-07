@@ -3,8 +3,8 @@ package fstree
 import (
 	"testing"
 
-	"github.com/jobs-build/amber-store-core/chunkers"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/chunkers"
+	"github.com/amber-store/core/key"
 )
 
 // collector records emitted objects and is the test's Emit.

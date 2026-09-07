@@ -3,8 +3,8 @@ package fstree
 import (
 	"fmt"
 
+	"github.com/amber-store/core/key"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/jobs-build/amber-store-core/key"
 )
 
 // DecodeFileNode decodes a FileNode body (a CBOR array of child keys) into its

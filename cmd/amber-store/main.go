@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/jobs-build/amber-store-core/chunkers"
-	"github.com/jobs-build/amber-store-core/ingest"
-	"github.com/jobs-build/amber-store-core/packstore"
+	"github.com/amber-store/core/chunkers"
+	"github.com/amber-store/core/ingest"
+	"github.com/amber-store/core/packstore"
 	"github.com/urfave/cli/v2"
 )
 

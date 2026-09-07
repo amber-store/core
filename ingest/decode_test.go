@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/amber-store/core/chunkers"
+	"github.com/amber-store/core/key"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/jobs-build/amber-store-core/chunkers"
-	"github.com/jobs-build/amber-store-core/key"
 	"golang.org/x/sys/unix"
 )
 
