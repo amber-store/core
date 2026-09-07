@@ -31,7 +31,7 @@ import (
 	"io"
 	"iter"
 
-	"github.com/jobs-build/amber-store-core/fstree"
+	"github.com/amber-store/core/fstree"
 )
 
 // packMagic identifies the wire pack format and its version (the trailing byte).

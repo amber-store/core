@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/key"
 )
 
 // ListEntries returns up to limit entries of the directory object dir whose

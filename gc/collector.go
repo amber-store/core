@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jobs-build/amber-store-core/fstree"
-	"github.com/jobs-build/amber-store-core/key"
-	"github.com/jobs-build/amber-store-core/packstore"
-	"github.com/jobs-build/amber-store-core/reference"
-	"github.com/jobs-build/amber-store-core/refstore"
+	"github.com/amber-store/core/fstree"
+	"github.com/amber-store/core/key"
+	"github.com/amber-store/core/packstore"
+	"github.com/amber-store/core/reference"
+	"github.com/amber-store/core/refstore"
 )
 
 // Collector implements the cycle and the reference hooks over an open

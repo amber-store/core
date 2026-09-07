@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/jobs-build/amber-store-core/chunkers"
-	"github.com/jobs-build/amber-store-core/fstree"
+	"github.com/amber-store/core/chunkers"
+	"github.com/amber-store/core/fstree"
 )
 
 func TestBuildDir_FailFastOnUnreadableFile(t *testing.T) {

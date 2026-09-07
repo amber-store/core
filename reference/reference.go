@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"unicode/utf8"
 
+	"github.com/amber-store/core/key"
 	"github.com/fxamacker/cbor/v2"
-	"github.com/jobs-build/amber-store-core/key"
 )
 
 // MaxNameLen is the maximum reference name length in bytes.

@@ -10,11 +10,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/jobs-build/amber-store-core/amberignore"
-	"github.com/jobs-build/amber-store-core/chunkers"
-	"github.com/jobs-build/amber-store-core/fstree"
-	"github.com/jobs-build/amber-store-core/key"
-	"github.com/jobs-build/amber-store-core/packstore"
+	"github.com/amber-store/core/amberignore"
+	"github.com/amber-store/core/chunkers"
+	"github.com/amber-store/core/fstree"
+	"github.com/amber-store/core/key"
+	"github.com/amber-store/core/packstore"
 )
 
 // collectSequential builds the tree at dir with the sequential driver and returns

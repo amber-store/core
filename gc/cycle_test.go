@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jobs-build/amber-store-core/packstore"
+	"github.com/amber-store/core/packstore"
 )
 
 func TestRunReapsDeadKeepsLive(t *testing.T) {

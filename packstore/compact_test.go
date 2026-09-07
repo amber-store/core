@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/key"
 )
 
 // compactStore builds a store with objs[0..1] and objs[2..3] in two sealed

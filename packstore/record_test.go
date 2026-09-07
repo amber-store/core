@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
+	"github.com/amber-store/core/amberpack"
 )
 
 // recordObj is o as a pre-encoded record: what a caller that already holds

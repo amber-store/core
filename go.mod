@@ -1,4 +1,4 @@
-module github.com/jobs-build/amber-store-core
+module github.com/amber-store/core
 
 go 1.26.3
 

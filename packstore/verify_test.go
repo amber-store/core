@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
+	"github.com/amber-store/core/amberpack"
 )
 
 // sealedStore builds a store with sealed segments and returns its dir.

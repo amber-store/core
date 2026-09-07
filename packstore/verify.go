@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/key"
 	"github.com/zeebo/blake3"
 )
 

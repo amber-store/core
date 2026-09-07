@@ -1,6 +1,6 @@
 package packstore
 
-import "github.com/jobs-build/amber-store-core/key"
+import "github.com/amber-store/core/key"
 
 // MarkSet is a liveness mark over a snapshot: one bit per sealed record,
 // slotted by footer index, plus a map for the active segment. Not

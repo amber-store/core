@@ -12,8 +12,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/key"
 )
 
 func openStore(t *testing.T, dir string, opts ...Option) *Store {

@@ -3,7 +3,7 @@ package fstree
 import (
 	"fmt"
 
-	"github.com/jobs-build/amber-store-core/key"
+	"github.com/amber-store/core/key"
 )
 
 // ChildKeys returns the keys directly referenced by the object with key k
