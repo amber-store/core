@@ -62,7 +62,7 @@ packages. The amber-store binaries behave exactly as before.
 - Moving `sshsign` into core. Core is a local store with no auth; signature
   verification stays in amber-store.
 
-## Phase 1: core parity (release v0.0.5)
+## Phase 1: core parity (release v0.0.6)
 
 One PR on branch `amber-store-parity`.
 
@@ -83,7 +83,7 @@ One PR on branch `amber-store-parity`.
   counts acquires and releases drains one entry; afterwards both counts are
   1 and the release happened after the write.
 
-Release: merge, tag `v0.0.5`, notes.
+Release: merge, tag `v0.0.6`, notes (v0.0.5 was taken by PRs #6 and #7, merged the same afternoon).
 
 ## Phase 2: amber-store imports core
 
@@ -99,7 +99,7 @@ One PR on branch `use-core`.
   The three callers in `embedded/embedded.go` call
   `sshsign.DecodeVerifiedReference`. `sshsign` does not import `reference`
   today and core's `reference` does not import `sshsign`, so no cycle.
-- `go get github.com/amber-store/core@v0.0.5`, `go mod tidy`; direct
+- `go get github.com/amber-store/core@v0.0.6`, `go mod tidy`; direct
   dependencies only the copies used (pebble, xorfilter, cdc-chunkers, cbor,
   blake3, klauspost/compress) become indirect or drop.
 - Verify: `gofmt -l`, `go build ./...`, `go vet ./...`, `go test ./...`.
@@ -110,9 +110,9 @@ One PR on branch `use-core`.
 Low. The compile spike proved the API surface; the ported tests pin the gate
 and the Status serialization; amber-store's own suite runs against core's
 packages before the merge. Rollback is `git revert` of one merge on either
-side; core v0.0.5 is additive over v0.0.4.
+side; core v0.0.6 is additive over v0.0.5.
 
 ## Order
 
-1. Core PR → merge → `v0.0.5`.
-2. amber-store PR pinned to `v0.0.5` → merge → pull local checkout.
+1. Core PR → merge → `v0.0.6`.
+2. amber-store PR pinned to `v0.0.6` → merge → pull local checkout.
