@@ -38,6 +38,12 @@ type Status struct {
 // Status marks from the current references and scores every sealed pack —
 // a full mark walk, the cost of keeping no persistent liveness state.
 func (c *Collector) Status(ctx context.Context) (Status, error) {
+	// The advisory mark probes sealed footers without scrub registration,
+	// so serialize with cycles: a sweep must not munmap a victim under the
+	// walk. A Run racing a long Status reports ErrCycleRunning, exactly as
+	// it would against another cycle.
+	c.cycleMu.Lock()
+	defer c.cycleMu.Unlock()
 	recs, err := c.refs.All()
 	if err != nil {
 		return Status{}, err
