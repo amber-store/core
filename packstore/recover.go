@@ -40,6 +40,12 @@ func scanActive(path string) (scanResult, error) {
 		// too). Reset to empty.
 		return res, nil
 	}
+	// A complete footer survives a crash before the seal rename. Trust its
+	// index even when body corruption would stop the prefix scan early.
+	if _, err := parseFooter(b); err == nil {
+		res.size, res.sealed = int64(len(b)), true
+		return res, nil
+	}
 	off := int64(len(magicHeader))
 	for off < int64(len(b)) {
 		if b[off] == tagSeal {

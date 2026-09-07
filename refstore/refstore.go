@@ -55,6 +55,21 @@ func (s *Store) Put(name string, record []byte) error {
 	return s.db.Set([]byte(name), record, s.writeOpts)
 }
 
+// PutBatch publishes records atomically, using the configured write durability.
+// When names repeat, the last record wins. An empty batch changes nothing.
+func (s *Store) PutBatch(records []Record) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	b := s.db.NewBatch()
+	defer b.Close()
+	for _, record := range records {
+		if err := b.Set([]byte(record.Name), record.Data, nil); err != nil {
+			return err
+		}
+	}
+	return b.Commit(s.writeOpts)
+}
+
 // Get returns the record stored under name, or ErrNotFound.
 func (s *Store) Get(name string) ([]byte, error) {
 	v, closer, err := s.db.Get([]byte(name))

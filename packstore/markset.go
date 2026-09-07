@@ -1,12 +1,18 @@
 package packstore
 
-import "github.com/amber-store/core/key"
+import (
+	"slices"
+
+	"github.com/amber-store/core/key"
+)
 
 // MarkSet is a liveness mark over a snapshot: one bit per sealed record,
 // slotted by footer index, plus a map for the active segment. Not
 // concurrency-safe. Run it under the writer quiesce GC requires.
+// Snapshots own their footer indexes, using 44 additional bytes per sealed key.
+// This keeps lookups valid after a repair replaces and unmaps a segment.
 type MarkSet struct {
-	segs   []*sealedSegment
+	segs   []*footerView
 	bits   [][]uint64
 	active map[key.Key]bool // present in active segment, value = marked
 	marked int              // keys marked so far
@@ -17,7 +23,10 @@ func (s *Store) NewMarkSet() *MarkSet {
 	defer s.mu.RUnlock()
 	m := &MarkSet{active: map[key.Key]bool{}}
 	for _, g := range s.sealed {
-		m.segs = append(m.segs, g)
+		// Own the index bytes: repair or removal can retire the original mmap.
+		footer := *g.fv
+		footer.entries = slices.Clone(footer.entries)
+		m.segs = append(m.segs, &footer)
 		m.bits = append(m.bits, make([]uint64, (g.fv.keyCount+63)/64))
 	}
 	if s.active != nil {
@@ -35,10 +44,10 @@ func (m *MarkSet) locate(k key.Key) (seg, pos int, inActive, ok bool) {
 	}
 	for i := len(m.segs) - 1; i >= 0; i-- {
 		g := m.segs[i]
-		if !g.fv.filter.Contains(filterKey(k)) {
+		if !g.filter.Contains(filterKey(k)) {
 			continue
 		}
-		if p, found := g.fv.lookupPos(k); found {
+		if p, found := g.lookupPos(k); found {
 			return i, p, false, true
 		}
 	}
