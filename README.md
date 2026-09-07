@@ -156,5 +156,8 @@ go test ./...
 
 ## License
 
-Licensed under the GNU Affero General Public License v3.0. See [`LICENSE`](LICENSE)
-for the full text.
+Licensed under the GNU Lesser General Public License, version 3 only
+(`LGPL-3.0-only`). See [`LICENSE`](LICENSE) for the LGPL terms and
+[`COPYING`](COPYING) for the GPL terms incorporated by the LGPL.
+
+Third-party notices retain their stated licenses.
