@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Port the three things only amber-store's copy of core had into core, release v0.0.5, then make amber-store delete its 13 copied packages and import core.
+**Goal:** Port the three things only amber-store's copy of core had into core, release v0.0.6, then make amber-store delete its 13 copied packages and import core.
 
 **Architecture:** Phase 1 (Tasks 1–3) is in `amber-store/core` on branch `amber-store-parity`: `gc.Collector.BeginWrite` and the `Status` serialization with their tests, and `inbox.WithGate`. Phase 2 (Tasks 4–5) is in `amber-store/amber-store` on branch `use-core`: remove the copies, rewrite imports, relocate `DecodeVerified` next to `sshsign`, verify, merge.
 
@@ -322,7 +322,7 @@ Claude-Session: https://claude.ai/code/session_01GAJmL5jzzyWvFiikdwFCEn"
 
 ---
 
-### Task 3: core PR, merge, v0.0.5
+### Task 3: core PR, merge, v0.0.6 (was planned as v0.0.5; that tag went to PRs #6 and #7)
 
 - [ ] **Step 1: Verify and push**
 
@@ -348,7 +348,7 @@ Verified with `gofmt -l`, `go build ./...`, `go vet ./...`, `go test -race ./...
 
 https://claude.ai/code/session_01GAJmL5jzzyWvFiikdwFCEn
 EOF
-)" && N=$(gh pr list --head amber-store-parity --json number --jq '.[0].number') && gh pr merge "$N" --merge --delete-branch && git checkout main && git pull --ff-only && gh release create v0.0.5 --target main --title v0.0.5 --notes "$(cat <<'EOF'
+)" && N=$(gh pr list --head amber-store-parity --json number --jq '.[0].number') && gh pr merge "$N" --merge --delete-branch && git checkout main && git pull --ff-only && gh release create v0.0.6 --target main --title v0.0.6 --notes "$(cat <<'EOF'
 ## What's Changed
 * `gc.Collector.BeginWrite`: a write-span gate against the sweep, for callers that write objects outside `PrepareRef` (an ingest, a pull, an inbox drain). `gc.Status` now serializes with running cycles. Both ported from amber-store, with tests.
 * `inbox.WithGate`: a variadic option on `inbox.Open` that brackets each drain's store write with a gate such as `BeginWrite`.
@@ -356,10 +356,10 @@ EOF
 
 **Full Changelog**: https://github.com/amber-store/core/compare/v0.0.4...v0.0.5
 EOF
-)" && cd /private/tmp && GOFLAGS=-mod=mod go list -m github.com/amber-store/core@v0.0.5
+)" && cd /private/tmp && GOFLAGS=-mod=mod go list -m github.com/amber-store/core@v0.0.6
 ```
 
-Expected: the release URL, then `github.com/amber-store/core v0.0.5`.
+Expected: the release URL, then `github.com/amber-store/core v0.0.6`.
 
 ---
 
@@ -373,7 +373,7 @@ Expected: the release URL, then `github.com/amber-store/core v0.0.5`.
 - Modify: `$A/embedded/embedded.go:145,185,229`; every Go file importing one of the 13 packages; `$A/go.mod`, `$A/go.sum`
 
 **Interfaces:**
-- Consumes: core v0.0.5 (`gc.Collector.BeginWrite`, `inbox.WithGate`, and everything the copies exported).
+- Consumes: core v0.0.6 (`gc.Collector.BeginWrite`, `inbox.WithGate`, and everything the copies exported).
 - Produces: `func DecodeVerifiedReference(raw []byte) (reference.Reference, error)` in package `sshsign`.
 
 - [ ] **Step 1: Branch, delete, rewrite imports**
@@ -466,7 +466,7 @@ func TestDecodeVerifiedReference(t *testing.T) {
 - [ ] **Step 3: Add the dependency, then confirm exactly the expected failures**
 
 ```bash
-cd $A && go get github.com/amber-store/core@v0.0.5 && go mod tidy && go build ./... 2>&1 | grep -v '^#'; go vet ./sshsign/ 2>&1 | grep -v '^#' | head -3
+cd $A && go get github.com/amber-store/core@v0.0.6 && go mod tidy && go build ./... 2>&1 | grep -v '^#'; go vet ./sshsign/ 2>&1 | grep -v '^#' | head -3
 ```
 
 Expected: build errors only at `embedded/embedded.go:145`, `:185`, `:229` (`undefined: reference.DecodeVerified`); vet of `sshsign` reports `undefined: sshsign.DecodeVerifiedReference`. Nothing else.
@@ -518,7 +518,7 @@ In `embedded/embedded.go`, change the three `reference.DecodeVerified(` calls to
 cd $A && go mod tidy && f=$(gofmt -l $(git ls-files '*.go')); [ -n "$f" ] && echo "$f" | xargs gofmt -w; gofmt -l $(git ls-files '*.go'); go build ./... && go vet ./... && go test ./... 2>&1 | grep -E '^(ok|FAIL|---|panic)' | tail -40; echo "--- go.mod direct block:"; awk '/^require \(/{f=1;next} /^\)/{f=0} f && !/indirect/' go.mod
 ```
 
-Expected: no gofmt output; all packages `ok`; the direct block contains `github.com/amber-store/core v0.0.5` and no longer lists `xorfilter`, `go-cdc-chunkers`, `pebble`, `blake3` or `klauspost/compress` as direct (they become indirect or drop; `fxamacker/cbor` stays direct only if amber-store's own code imports it).
+Expected: no gofmt output; all packages `ok`; the direct block contains `github.com/amber-store/core v0.0.6` and no longer lists `xorfilter`, `go-cdc-chunkers`, `pebble`, `blake3` or `klauspost/compress` as direct (they become indirect or drop; `fxamacker/cbor` stays direct only if amber-store's own code imports it).
 
 - [ ] **Step 6: Commit**
 
@@ -544,7 +544,7 @@ Claude-Session: https://claude.ai/code/session_01GAJmL5jzzyWvFiikdwFCEn"
 
 ```bash
 cd $A && git push -u origin use-core && gh pr create --repo amber-store/amber-store --title "Use github.com/amber-store/core instead of copied packages" --body "$(cat <<'EOF'
-Deletes the 13 package copies (`amberignore`, `amberpack`, `cborx`, `chunkers`, `fstree`, `gc`, `inbox`, `key`, `packstore`, `reference`, `refstore`, `tarexport`, `tarextract`) and imports `github.com/amber-store/core` v0.0.5. Eight copies were already byte-identical to core; the rest differed by core's additive record write path and by three things this repo had grown, which are now in core v0.0.5 (`gc.Collector.BeginWrite`, `gc.Status` serializing with cycles, `inbox.WithGate`).
+Deletes the 13 package copies (`amberignore`, `amberpack`, `cborx`, `chunkers`, `fstree`, `gc`, `inbox`, `key`, `packstore`, `reference`, `refstore`, `tarexport`, `tarextract`) and imports `github.com/amber-store/core` v0.0.6. Eight copies were already byte-identical to core; the rest differed by core's additive record write path and by three things this repo had grown, which are now in core v0.0.6 (`gc.Collector.BeginWrite`, `gc.Status` serializing with cycles, `inbox.WithGate`).
 
 `reference.DecodeVerified` moves to `sshsign.DecodeVerifiedReference` with its test: it verifies SSH signatures, which belongs with `sshsign` here rather than in core's `reference`. Its three callers in `embedded/` are updated.
 
