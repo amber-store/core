@@ -102,6 +102,7 @@ type Store struct {
 	// endScrub, waitScrubs.
 	scrubMu sync.Mutex
 	scrubN  int
+	retired []*sealedSegment // protected by scrubMu; unmapped when the last scrub ends
 	scrubC  *sync.Cond
 
 	writesMu sync.Mutex
@@ -124,6 +125,10 @@ func (s *Store) endScrub() {
 	s.scrubMu.Lock()
 	s.scrubN--
 	if s.scrubN == 0 {
+		for _, seg := range s.retired {
+			seg.close()
+		}
+		s.retired = nil
 		s.scrubC.Broadcast()
 	}
 	s.scrubMu.Unlock()

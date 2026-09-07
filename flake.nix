@@ -13,6 +13,14 @@
         nixpkgs.lib.genAttrs (import systems)
         (system: f system nixpkgs.legacyPackages.${system});
     in {
+      formatter = eachSystem (system: pkgs:
+        pkgs.writeShellApplication {
+          name = "format";
+          runtimeInputs = [ pkgs.go pkgs.findutils ];
+          text = ''
+            find . -name '*.go' -not -path './.git/*' -print0 | xargs -0 -r gofmt -w
+          '';
+        });
 
       devShells = eachSystem (system: pkgs: {
         default = pkgs.mkShell {
