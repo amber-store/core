@@ -132,6 +132,20 @@ func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
 	return release, release, nil
 }
 
+// BeginWrite gates one object-write span (an ingest, a pull, an inbox
+// drain) against the sweep. The span holds the reference lock shared:
+// the sweep waits out in-flight writes, and a write stalls while a sweep
+// runs — never during the mark, which writers pass behind the write
+// barrier. Without the gate a dedup hit against a record in a condemned
+// pack could report success and then lose the record to the pack's
+// removal (packstore.Compact must not overlap ingests). Returns the
+// release, idempotent; call it when the span's writes are durable.
+func (c *Collector) BeginWrite() (done func()) {
+	c.refLock.RLock()
+	var once sync.Once
+	return func() { once.Do(c.refLock.RUnlock) }
+}
+
 // ReleaseRef records that one reference naming root was deleted or
 // overwritten. The mark-and-sweep collector keeps no per-root state, so
 // this is a no-op: the next cycle simply no longer marks from the root.

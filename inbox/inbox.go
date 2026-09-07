@@ -25,6 +25,7 @@ type Inbox struct {
 	failDir string
 	store   *packstore.Store
 	log     *slog.Logger
+	gate    func() func() // see WithGate
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -43,7 +44,17 @@ type workItem struct {
 // Open prepares the inbox directory tree, recovers entries left by a previous
 // run, and starts `workers` processing goroutines. workers <= 0 means
 // runtime.GOMAXPROCS(0). A nil log discards.
-func Open(dir string, store *packstore.Store, workers int, log *slog.Logger) (*Inbox, error) {
+// Option tweaks Open.
+type Option func(*Inbox)
+
+// WithGate brackets every entry's store write with gate: acquire before the
+// WriteParallel, release after. The GC collector's BeginWrite is the intended
+// gate — it keeps a drain's dedup hits from racing a sweep's pack removal.
+func WithGate(gate func() (done func())) Option {
+	return func(ib *Inbox) { ib.gate = gate }
+}
+
+func Open(dir string, store *packstore.Store, workers int, log *slog.Logger, opts ...Option) (*Inbox, error) {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -59,6 +70,9 @@ func Open(dir string, store *packstore.Store, workers int, log *slog.Logger) (*I
 		groups:  map[key.Key]int{},
 	}
 	ib.cond = sync.NewCond(&ib.mu)
+	for _, o := range opts {
+		o(ib)
+	}
 	for _, d := range []string{ib.dir, ib.tmpDir, ib.failDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, err
@@ -264,7 +278,14 @@ func (ib *Inbox) process(name string) {
 			}
 		}
 	}
-	_, werr := ib.store.WriteParallel(seq, packstore.WriteOpts{Verify: true})
+	var werr error
+	if ib.gate != nil {
+		done := ib.gate()
+		_, werr = ib.store.WriteParallel(seq, packstore.WriteOpts{Verify: true})
+		done()
+	} else {
+		_, werr = ib.store.WriteParallel(seq, packstore.WriteOpts{Verify: true})
+	}
 	f.Close()
 	if werr != nil {
 		ib.quarantine(name, werr)
