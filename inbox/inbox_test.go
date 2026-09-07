@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/amber-store/core/amberpack"
@@ -173,5 +174,49 @@ func TestCorruptPackQuarantined(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "failed", name)); err != nil {
 		t.Fatalf("entry should be quarantined under failed/: %v", err)
+	}
+}
+
+func TestWithGateBracketsDrain(t *testing.T) {
+	store := newTestStore(t)
+	obj := blobObject(t, []byte("gated entry"))
+	var mu sync.Mutex
+	acquired, released := 0, 0
+	writtenAtRelease := false
+	gate := func() func() {
+		mu.Lock()
+		acquired++
+		mu.Unlock()
+		return func() {
+			has, _ := store.Has(obj.Key)
+			mu.Lock()
+			released++
+			writtenAtRelease = has
+			mu.Unlock()
+		}
+	}
+	ib, err := Open(filepath.Join(t.TempDir(), "inbox"), store, 1, nil, WithGate(gate))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { ib.Close() })
+
+	root := obj.Key
+	tmp, h, _, err := ib.Stage(Meta{Ref: "r", Root: root[:]}, bytes.NewReader(packBody(t, obj)))
+	if err != nil {
+		t.Fatalf("Stage: %v", err)
+	}
+	if added, err := ib.Commit(tmp, h, root); err != nil || !added {
+		t.Fatalf("Commit: added=%v err=%v", added, err)
+	}
+	ib.WaitFor(root)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if acquired != 1 || released != 1 {
+		t.Fatalf("gate acquired %d released %d, want 1/1", acquired, released)
+	}
+	if !writtenAtRelease {
+		t.Fatal("gate released before the entry's objects were written")
 	}
 }
