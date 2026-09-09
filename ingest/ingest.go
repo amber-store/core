@@ -43,7 +43,7 @@ type Progress interface {
 // selects the library defaults; the parameters determine every object key, so
 // two builds of the same tree agree only when their ChunkOpts agree.
 type ChunkOpts struct {
-	Byte           *chunkers.ByteOpts // byte-chunker sizes; nil selects the library defaults
+	Byte           *chunkers.ByteOpts // byte-chunker sizes; nil selects chunkers.Default{Min,Normal,Max}Size
 	ItemBits       int                // item chunker average run = 2^bits; 0 selects DefaultItemBits
 	XattrInlineMax int                // xattr spill threshold in bytes; 0 selects DefaultXattrInlineMax
 }
