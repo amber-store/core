@@ -28,7 +28,7 @@ var ErrClosed = errors.New("packstore: store closed")
 
 // DefaultSegmentSize is the default rotation threshold: the active segment is
 // sealed once it reaches this many bytes.
-const DefaultSegmentSize = 256 << 20 // 256 MiB
+const DefaultSegmentSize = 2 << 30 // 2 GiB
 
 const (
 	sealedSuffix = ".seg"
