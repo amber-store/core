@@ -59,6 +59,10 @@ type Opts struct {
 	NoIgnore bool
 	// Progress, when non-nil, receives build-progress events.
 	Progress Progress
+	// Exclude lists names directly under the root that are never ingested,
+	// whatever NoIgnore says. It applies to the root directory only; the
+	// same name deeper in the tree is ingested normally.
+	Exclude []string
 }
 
 // jobs resolves the effective worker count.
@@ -67,6 +71,18 @@ func (o Opts) jobs() int {
 		return runtime.GOMAXPROCS(0)
 	}
 	return o.Jobs
+}
+
+// excludeSet turns Opts.Exclude into a set; nil when empty.
+func (o Opts) excludeSet() map[string]bool {
+	if len(o.Exclude) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(o.Exclude))
+	for _, n := range o.Exclude {
+		m[n] = true
+	}
+	return m
 }
 
 // driver builds a driver from the chunking options.
@@ -115,7 +131,7 @@ func Objects(path string, opts Opts) (iter.Seq2[fstree.Object, error], *key.Key,
 	var buildRoot func(fstree.Emit) (key.Key, error)
 	if isDir {
 		buildRoot = func(emit fstree.Emit) (key.Key, error) {
-			b := &pbuilder{d: d, emit: emit, sem: make(chan struct{}, jobs)}
+			b := &pbuilder{d: d, emit: emit, sem: make(chan struct{}, jobs), root: path, exclude: opts.excludeSet()}
 			return b.buildDir(path, ign, emit)
 		}
 	} else {

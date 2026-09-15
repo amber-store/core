@@ -33,6 +33,23 @@ func Scan(dir string, noIgnore bool, jobs int) (files int64, bytes int64, err er
 	return scanTree(dir, ign, jobs)
 }
 
+// ScanWith is Scan with every relevant option of opts applied: NoIgnore,
+// Jobs and Exclude, so that the totals match what Objects(dir, opts) reads.
+func ScanWith(dir string, opts Opts) (files int64, bytes int64, err error) {
+	var ign *amberignore.Matcher
+	if !opts.NoIgnore {
+		if ign, err = amberignore.Root(dir); err != nil {
+			return 0, 0, err
+		}
+	}
+	s := &scanner{sem: make(chan struct{}, opts.jobs()), root: dir, exclude: opts.excludeSet()}
+	s.walk(dir, ign)
+	if e := s.err(); e != nil {
+		return 0, 0, e
+	}
+	return s.files.Load(), s.bytes.Load(), nil
+}
+
 // scanTree implements Scan over an explicit matcher (nil ingests everything).
 func scanTree(dir string, ign *amberignore.Matcher, jobs int) (files int64, bytes int64, err error) {
 	if jobs < 1 {
@@ -53,6 +70,10 @@ type scanner struct {
 
 	mu       sync.Mutex
 	firstErr error
+
+	// root and exclude implement Opts.Exclude for ScanWith.
+	root    string
+	exclude map[string]bool
 }
 
 func (s *scanner) setErr(e error) {
@@ -77,6 +98,9 @@ func (s *scanner) walk(dir string, ign *amberignore.Matcher) {
 	}
 	var wg sync.WaitGroup
 	for _, de := range ents {
+		if dir == s.root && s.exclude[de.Name()] {
+			continue
+		}
 		if ign.Ignored(de.Name(), de.IsDir()) {
 			continue
 		}

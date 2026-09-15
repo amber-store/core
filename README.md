@@ -70,7 +70,7 @@ directory is **single-owner**: never open one from two live processes.
 | `key` | The 32-byte content key: type, length, truncated BLAKE3 hash. |
 | `fstree` | Tree objects (encode/decode), bottom-up builders, and the read paths: entry lookup, ordered listing, content streaming, reachable-set walks, completeness checks. |
 | `chunkers` | Content-defined byte chunking (ultracdc) and item chunking for tree nodes. |
-| `ingest` | Build a tree from a local directory (or single file): `Objects` streams every built object plus the resolved root; `Dir` writes straight into a packstore; `Scan` sizes progress displays. Honors `.amberignore`. |
+| `ingest` | Build a tree from a local directory (or single file): `Objects` streams every built object plus the resolved root; `Dir` writes straight into a packstore; `Scan` sizes progress displays. Honors `.amberignore`; `Opts.Exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
 | `packstore` | The local object store: append-only pack segments with parallel, deduplicating, verifying writers. |
 | `refstore` | Pebble-backed name → record map for references. |

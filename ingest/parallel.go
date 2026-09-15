@@ -24,6 +24,10 @@ type pbuilder struct {
 	// current goroutine, so a parent never blocks waiting for a slot held by
 	// one of its own descendants — the recursion cannot deadlock.
 	sem chan struct{}
+	// root and exclude implement Opts.Exclude: names in exclude are skipped
+	// when path == root.
+	root    string
+	exclude map[string]bool
 }
 
 // buildDir builds the directory at path and returns its root key. Entries
@@ -38,6 +42,9 @@ func (b *pbuilder) buildDir(path string, ign *amberignore.Matcher, emit fstree.E
 	}
 	kept := make([]os.DirEntry, 0, len(ents))
 	for _, de := range ents {
+		if path == b.root && b.exclude[de.Name()] {
+			continue
+		}
 		if !ign.Ignored(de.Name(), de.IsDir()) {
 			kept = append(kept, de)
 		}
