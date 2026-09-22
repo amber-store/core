@@ -91,10 +91,10 @@ func (g *sealedSegment) verify(ctx context.Context) error {
 }
 
 // verifyObject recomputes o.Key from o.Data and reports ErrVerify on mismatch.
-// For Blob and XattrSet — whose key length is the serialized byte length — it
-// also checks the length field. Aggregate types (FileNode/DirLeaf/DirNode)
-// carry a logical length the store cannot recompute without parsing, so only
-// their hash is checked.
+// For Blob, XattrSet and Commit — whose key length is the serialized byte
+// length — it also checks the length field. Aggregate types
+// (FileNode/DirLeaf/DirNode) carry a logical length the store cannot recompute
+// without parsing, so only their hash is checked.
 func verifyObject(o Object) error {
 	sum := blake3.Sum256(o.Data)
 	want, err := key.NewFromHash(o.Key.Type(), o.Key.Length(), sum)
@@ -105,7 +105,7 @@ func verifyObject(o Object) error {
 		return fmt.Errorf("%w: payload hashes to %s, not %s", ErrVerify, want, o.Key)
 	}
 	switch o.Key.Type() {
-	case key.Blob, key.XattrSet:
+	case key.Blob, key.XattrSet, key.Commit:
 		if o.Key.Length() != uint64(len(o.Data)) {
 			return fmt.Errorf("%w: %s length field %d != payload %d", ErrVerify, o.Key, o.Key.Length(), len(o.Data))
 		}
