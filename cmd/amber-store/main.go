@@ -42,6 +42,7 @@ func newApp() *cli.App {
 			exportCommand(),
 			restoreCommand(),
 			refCommand(),
+			commitCommand(),
 			gcCommand(),
 		},
 	}
