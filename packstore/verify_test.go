@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/key"
 )
 
 // sealedStore builds a store with sealed segments and returns its dir.
@@ -206,5 +207,25 @@ func TestVerifyScrubHashMismatchIsCorrupt(t *testing.T) {
 	}
 	if !errors.Is(err, ErrVerify) {
 		t.Fatalf("want ErrVerify too, got %v", err)
+	}
+}
+
+func TestVerifyObjectChecksCommitLength(t *testing.T) {
+	// verifyObject does not parse payloads, so any bytes serve.
+	data := []byte("stand-in for a commit's canonical CBOR")
+	good, err := key.New(key.Commit, uint64(len(data)), data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyObject(Object{Key: good, Data: data}); err != nil {
+		t.Fatalf("honest commit key rejected: %v", err)
+	}
+	// Same payload hash, but a length field that lies about the byte length.
+	bad, err := key.New(key.Commit, uint64(len(data))+1, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyObject(Object{Key: bad, Data: data}); !errors.Is(err, ErrVerify) {
+		t.Fatalf("err = %v, want ErrVerify for a wrong length field", err)
 	}
 }

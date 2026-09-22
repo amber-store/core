@@ -57,7 +57,7 @@ func New(t Type, length uint64, serialized []byte) (Key, error) {
 }
 
 // Validate reports whether k is canonical: the reserved bit is clear, the type
-// is defined (0..4), and the length field is minimally encoded (its first byte
+// is defined (0..5), and the length field is minimally encoded (its first byte
 // is non-zero, except for the single 0x00 byte that encodes a zero length).
 func (k Key) Validate() error {
 	if k[0]&0x08 != 0 {
@@ -94,7 +94,7 @@ func (k Key) String() string {
 // NewFromHash assembles a canonical key from a CAS object type, a logical
 // payload length, and a precomputed full 256-bit BLAKE3 digest. The digest is
 // truncated to its leading bytes to fill the key. length is used verbatim: for
-// Blob/XattrSet it is the serialized byte length; for FileNode/DirLeaf/DirNode
+// Blob/XattrSet/Commit it is the serialized byte length; for FileNode/DirLeaf/DirNode
 // it is the logical size (see architecture/types.md). Returns ErrReservedType
 // if t is not a defined type.
 func NewFromHash(t Type, length uint64, fullHash [Size]byte) (Key, error) {

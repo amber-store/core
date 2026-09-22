@@ -15,12 +15,13 @@ const (
 	DirLeaf  Type = 2 // a contiguous run of directory entries
 	DirNode  Type = 3 // directory index node
 	XattrSet Type = 4 // spilled extended attributes
+	Commit   Type = 5 // snapshot record: tree, parent commits, author, committer, message
 )
 
-// IsValid reports whether t is a defined CAS object type (0..4). Types 5..15 are
+// IsValid reports whether t is a defined CAS object type (0..5). Types 6..15 are
 // reserved and must not be emitted; values above 15 do not fit the 4-bit field.
 func (t Type) IsValid() bool {
-	return t <= XattrSet
+	return t <= Commit
 }
 
 // String returns the type name, or "Type(n)" for reserved/unknown values.
@@ -36,6 +37,8 @@ func (t Type) String() string {
 		return "DirNode"
 	case XattrSet:
 		return "XattrSet"
+	case Commit:
+		return "Commit"
 	default:
 		return fmt.Sprintf("Type(%d)", uint8(t))
 	}

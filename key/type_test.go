@@ -3,12 +3,12 @@ package key
 import "testing"
 
 func TestType_IsValid(t *testing.T) {
-	for ty := Type(0); ty <= 4; ty++ {
+	for ty := Type(0); ty <= 5; ty++ {
 		if !ty.IsValid() {
 			t.Errorf("Type(%d) should be valid", uint8(ty))
 		}
 	}
-	for _, ty := range []Type{5, 6, 15, 16, 255} {
+	for _, ty := range []Type{6, 7, 15, 16, 255} {
 		if ty.IsValid() {
 			t.Errorf("Type(%d) should be invalid", uint8(ty))
 		}
@@ -22,6 +22,7 @@ func TestType_String(t *testing.T) {
 		DirLeaf:  "DirLeaf",
 		DirNode:  "DirNode",
 		XattrSet: "XattrSet",
+		Commit:   "Commit",
 		Type(7):  "Type(7)",
 	}
 	for ty, want := range cases {

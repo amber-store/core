@@ -2,6 +2,9 @@
 // DirLeaf, DirNode, XattrSet, Blob) as deterministic CBOR per
 // architecture/fstree.md, and builds files and directories bottom-up by
 // streaming. See architecture/types.md for the length-field semantics.
+//
+// The object-graph walks (ChildKeys, ReachableKeys, CheckComplete) also follow
+// Commit objects (package commit), whose children are a tree and parent commits.
 package fstree
 
 import "github.com/amber-store/core/key"

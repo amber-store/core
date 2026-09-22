@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -311,5 +312,82 @@ func TestE2E_GC(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(got), "fresh content") {
 		t.Error("restored content wrong after gc")
+	}
+}
+
+func TestE2E_Commit(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	store := t.TempDir()
+	seg := []string{"--store", store, "--segment-size", "4096"}
+	run := func(args ...string) string {
+		t.Helper()
+		out, err := runApp(t, append(slices.Clone(seg), args...)...)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		return strings.TrimSpace(out)
+	}
+	create := []string{"commit", "create", "--ref", "main",
+		"--author", "Ann <ann@example.com>", "--date", "2026-01-02T03:04:05+01:00"}
+
+	root1 := run("ingest", "--no-progress", src)
+	c1 := run(append(slices.Clone(create), "-m", "first", root1)...)
+
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("alpha, revised"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root2 := run("ingest", "--no-progress", src)
+	c2 := run(append(slices.Clone(create), "--parent", "ref:main", "-m", "second", root2)...)
+	if c1 == c2 || c2 == root2 {
+		t.Fatalf("commit keys: c1 %s, c2 %s, root2 %s", c1, c2, root2)
+	}
+	if got := run("ref", "get", "main"); got != c2 {
+		t.Errorf("ref get main = %s, want the second commit %s", got, c2)
+	}
+
+	show := run("commit", "show", "ref:main")
+	for _, want := range []string{
+		"commit " + c2, "tree " + root2, "parent " + c1,
+		"author Ann <ann@example.com> 2026-01-02T03:04:05+01:00", "    second",
+	} {
+		if !strings.Contains(show, want) {
+			t.Errorf("commit show output %q is missing %q", show, want)
+		}
+	}
+
+	// A commit stands in for its tree wherever a directory is expected.
+	for spec, want := range map[string]string{"ref:main": "a.txt", "ref:main@sub": "b.txt", c1: "a.txt", c1 + "/sub": "b.txt"} {
+		if out := run("ls", spec); !strings.Contains(out, want) {
+			t.Errorf("ls %s output %q does not mention %s", spec, out, want)
+		}
+	}
+
+	// History is reachable from the branch, so a forced gc keeps the first
+	// commit's tree: it still restores, with the original content.
+	time.Sleep(50 * time.Millisecond)
+	run("gc", "run", "--grace", "1ms", "--garbage", "0")
+	for commitKey, want := range map[string]string{c1: "alpha", c2: "alpha, revised"} {
+		dest := filepath.Join(t.TempDir(), "restored")
+		run("restore", commitKey, dest)
+		got, err := os.ReadFile(filepath.Join(dest, "a.txt"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != want {
+			t.Errorf("restored a.txt of %s = %q, want %q", commitKey, got, want)
+		}
+	}
+
+	// Rejections: a tree as a parent, a file as the tree, a missing author.
+	for name, args := range map[string][]string{
+		"tree as parent": {"commit", "create", "--author", "Ann", "-m", "x", "--parent", root1, root2},
+		"file as tree":   {"commit", "create", "--author", "Ann", "-m", "x", root2 + "/a.txt"},
+		"no author":      {"commit", "create", "-m", "x", root2},
+		"show a tree":    {"commit", "show", root2},
+	} {
+		if _, err := runApp(t, append(slices.Clone(seg), args...)...); err == nil {
+			t.Errorf("%s: command succeeded", name)
+		}
 	}
 }

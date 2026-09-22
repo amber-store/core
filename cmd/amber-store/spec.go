@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
@@ -64,11 +65,33 @@ func parseHexKey(s string) (key.Key, error) {
 	return k, nil
 }
 
+// peelCommit maps a Commit key to the directory root it records; any other
+// key is returned unchanged. Only a spec's root can be a commit — directory
+// entries never hold one.
+func peelCommit(objects *packstore.Store, k key.Key) (key.Key, error) {
+	if k.Type() != key.Commit {
+		return k, nil
+	}
+	data, err := objects.Get(k)
+	if err != nil {
+		return key.Key{}, fmt.Errorf("reading commit %s: %w", k, err)
+	}
+	rec, err := commit.Decode(data)
+	if err != nil {
+		return key.Key{}, fmt.Errorf("commit %s: %w", k, err)
+	}
+	return rec.Tree, nil
+}
+
 // descend resolves a slash-separated subpath from root and returns the target
 // entry's content key. Every traversed segment must be an entry carrying a
-// content key (a regular file or a directory).
+// content key (a regular file or a directory). A Commit root stands for its
+// tree.
 func descend(objects *packstore.Store, root key.Key, path string) (key.Key, error) {
-	k := root
+	k, err := peelCommit(objects, root)
+	if err != nil {
+		return key.Key{}, err
+	}
 	for seg := range strings.SplitSeq(path, "/") {
 		if seg == "" {
 			continue
