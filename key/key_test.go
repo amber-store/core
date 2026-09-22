@@ -113,7 +113,7 @@ func TestNewFromHash_LengthSizeBoundaries(t *testing.T) {
 
 func TestNewFromHash_ReservedType(t *testing.T) {
 	var full [32]byte
-	for _, ty := range []Type{5, 15, 16, 255} {
+	for _, ty := range []Type{6, 15, 16, 255} {
 		if _, err := NewFromHash(ty, 1, full); !errors.Is(err, ErrReservedType) {
 			t.Errorf("Type(%d): err = %v, want ErrReservedType", uint8(ty), err)
 		}
@@ -215,7 +215,7 @@ func TestValidate_ReservedBit(t *testing.T) {
 
 func TestValidate_ReservedType(t *testing.T) {
 	var k Key
-	k[0] = 5 << 4 // type 5, lengthSize 1
+	k[0] = 6 << 4 // type 6, lengthSize 1
 	k[1] = 0x01
 	if err := k.Validate(); !errors.Is(err, ErrReservedType) {
 		t.Errorf("err = %v, want ErrReservedType", err)
@@ -251,5 +251,22 @@ func TestString_Hex(t *testing.T) {
 	}
 	if len(got) != 2*Size {
 		t.Errorf("len(String()) = %d, want %d", len(got), 2*Size)
+	}
+}
+
+func TestNewFromHash_Commit(t *testing.T) {
+	var full [32]byte
+	k, err := NewFromHash(Commit, 100, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k[0] != 0x50 {
+		t.Errorf("header byte = %#x, want 0x50 (type 5, one length byte)", k[0])
+	}
+	if k.Type() != Commit || k.Length() != 100 {
+		t.Errorf("Type() = %v, Length() = %d; want Commit, 100", k.Type(), k.Length())
+	}
+	if err := k.Validate(); err != nil {
+		t.Errorf("Validate: %v", err)
 	}
 }
