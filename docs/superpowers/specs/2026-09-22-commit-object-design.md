@@ -156,7 +156,9 @@ already sets the precedent of a record package with its own encoder.
   --author 'Name <email>' [--committer 'Name <email>'] TREE-SPEC` prints
   the new commit key. The core CLI has no configured identity, so
   `--author` is required; the committer defaults to the author, and both
-  timestamps to now in the local zone.
+  timestamps to now in the local zone. `--date` (RFC 3339) sets them
+  instead, recording that time's zone offset; it keeps the end-to-end test
+  deterministic and serves imports.
 - `amber-store commit show SPEC` prints the record in a git-like layout.
 
 The two `commit` commands are separable. They are proposed because without
