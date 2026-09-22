@@ -263,13 +263,19 @@ func TestDecodeRejects(t *testing.T) {
 		return out
 	}
 	cases := map[string][]byte{
-		"garbage":         []byte("not cbor at all"),
-		"empty":           {},
-		"trailing byte":   append(bytes.Clone(good), 0x00),
-		"unknown key 7":   append(withHeader(good, 0xa6), 0x07, 0x00),
-		"missing message": withHeader(bytes.TrimSuffix(good, message), 0xa4),
-		"non-minimal tz":  replaceOnce(t, good, []byte{0x03, 0x18, 0x78}, []byte{0x03, 0x19, 0x00, 0x78}),
-		"tz out of range": replaceOnce(t, good, []byte{0x03, 0x18, 0x78}, []byte{0x03, 0x19, 0x05, 0xa0}), // 1440
+		"garbage":       []byte("not cbor at all"),
+		"empty":         {},
+		"trailing byte": append(bytes.Clone(good), 0x00),
+		// Accepted by the CBOR library's defaults; only the canonical
+		// re-encoding check stands between these and a second encoding of
+		// the same commit.
+		"self-described tag": append([]byte{0xd9, 0xd9, 0xf7}, good...),
+		"duplicate key 4":    append(withHeader(good, 0xa6), message...),
+		"bignum-tagged tz":   replaceOnce(t, good, []byte{0x03, 0x18, 0x78}, []byte{0x03, 0xc2, 0x41, 0x78}),
+		"unknown key 7":      append(withHeader(good, 0xa6), 0x07, 0x00),
+		"missing message":    withHeader(bytes.TrimSuffix(good, message), 0xa4),
+		"non-minimal tz":     replaceOnce(t, good, []byte{0x03, 0x18, 0x78}, []byte{0x03, 0x19, 0x00, 0x78}),
+		"tz out of range":    replaceOnce(t, good, []byte{0x03, 0x18, 0x78}, []byte{0x03, 0x19, 0x05, 0xa0}), // 1440
 		"identity missing email": replaceOnce(t, good,
 			cat([]byte{0xa4, 0x00}, tstr("Bob"), []byte{0x01}, tstr("")),
 			cat([]byte{0xa3, 0x00}, tstr("Bob"))),
