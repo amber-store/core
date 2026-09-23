@@ -108,8 +108,18 @@ func runIngest(c *cli.Context, cfg *ingestConfig) error {
 	if prog != nil {
 		opts.Progress = prog
 	}
+	// One write span over the ingest and the reference that names it: a GC
+	// cycle in another process cannot fall between the two and find objects
+	// whose reference is still to come, which only the grace period would
+	// protect.
+	endSpan, err := objects.BeginWrite()
+	if err != nil {
+		closeStore(objects, refs)
+		return err
+	}
 	root, _, err := ingest.Dir(objects, path, opts)
 	if err != nil {
+		endSpan()
 		closeStore(objects, refs)
 		return err
 	}
@@ -128,11 +138,13 @@ func runIngest(c *cli.Context, cfg *ingestConfig) error {
 			}
 		}
 		if err != nil {
+			endSpan()
 			closeStore(objects, refs)
 			return fmt.Errorf("tree stored (root %s) but creating reference %q failed: %w\nretry with: amber-store ref set %q %s",
 				root, cfg.ref, err, cfg.ref, root)
 		}
 	}
+	endSpan()
 	if err := closeStore(objects, refs); err != nil {
 		return err
 	}

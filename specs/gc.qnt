@@ -21,6 +21,11 @@
 // set, which is how a PUT landing between mark and sweep stays safe
 // without draining ingests before the mark.
 //
+// Across processes (architecture/packstore.md, "The gate") the collector
+// holds the writers and the reference publication of other processes to
+// the quiesce policy checked here, through one file lock, and keeps barrier
+// for the writers of its own process, whose grey set it can see.
+//
 // All maps are total over fixed domains (absent = epoch -1 / active flag)
 // so Apalache encodes them as constant-shape arrays.
 module gc {

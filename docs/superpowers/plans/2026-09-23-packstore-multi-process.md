@@ -304,3 +304,59 @@ segment afterwards (the write that finished the seal needed somewhere to go).
   that a reader's view follows a live writer by reading only what was
   appended. The sidecar is read before the data's length, since a record is
   written before its entry.
+
+### Task 3, found later: a creator must re-check its temporary file
+
+Under the race detector's timing, a store clearing away crash leftovers locked
+and removed another store's brand-new temporary segment in the instant before
+its creator locked it; the creator then locked an unlinked file and its rename
+failed. Creation now checks, like adoption, that the locked file is still at
+its path. Its own commit.
+
+### Task 4
+
+- The gate's state machine has one more flag than planned, `busy`: while one
+  goroutine takes or drops the file lock, the others wait, so that the first
+  span's view refresh (after a generation change) is finished before any
+  span reaches a duplicate check.
+- `Compact`, `Wipe` and `Remove` take the exclusive gate themselves and find
+  it held inside a collector's `BeginSweep` (the depth is counted), so none
+  of them can be run unsafely by a caller that forgot the gate.
+
+### Task 5
+
+- **A sweep yields.** With the yield disabled, a writer polling from another
+  store did not get the lock across 200 back-to-back sweeps: the lock is free
+  for microseconds between two sweeps. A store that just swept now leaves the
+  lock alone for 100 ms (two polls' worth) before `BeginSweep` takes it
+  again. `TestBackToBackSweepsYieldToAWaitingWriter`, seen failing without it.
+- `TestIdleForeignActiveSegmentIsCollected` was seen failing with idle
+  sealing disabled. `TestForeignPrepareRefWaitsForACycle` failed before the
+  change, and showed a test bug on the way: its helper cycle stayed parked on
+  a channel when the assertion failed, and the collector's `Close` then
+  waited for it until the ten-minute test timeout. It now releases the helper
+  on every path. Verification runs carry a short `-timeout` since then.
+- The concurrent test brackets each ingest and its reference put in one write
+  span. Objects another process wrote and has not referenced yet are
+  protected from a foreign cycle by the grace period alone, which the test
+  sets to a nanosecond; the span is what a writer uses when it wants more.
+  `amber-store ingest --ref` now does the same.
+
+### After Task 5: a lookup miss must not list the directory every time
+
+Measured against the branch before this work (dev Mac, 512 MiB of 4 KiB
+objects): with every miss listing the directory, `Has` on an absent key went
+from 0.04 / 0.27 / 2.35 us to 33 / 113 / 760 us at 8 / 64 / 516 sealed
+segments. A miss now first checks that the directory's modification time is
+unchanged since the last listing and that no active segment it reads has
+changed size, and lists only otherwise; the time is trusted only if it was two
+seconds old at the listing (git's racy-timestamp rule), so coarse filesystem
+timestamps cannot hide a new segment. `TestMissesDoNotListAnUnchangedDirectory`,
+`TestFastPathStillSeesOtherStoresWrites`. Its own commit. A miss that finds
+the view current does not search it a second time either. Steady state, with
+one foreign active segment: 2.5 / 2.8 / 5.6 us.
+
+Not done, a known lever: adoption runs the recovery a second time although
+the store already holds a view of the segment (open plus first write costs
+about twice an open). Taking over the view's index when the segment is clean
+would halve that; at jj scale it is about a millisecond.
