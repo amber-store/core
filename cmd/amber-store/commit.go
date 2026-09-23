@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/amber-store/core/commit"
+	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/gc"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
@@ -31,6 +33,7 @@ func commitCommand() *cli.Command {
 					&cli.StringFlag{Name: "committer", Usage: "committer as 'Name <email>' (default: the author)"},
 					&cli.StringFlag{Name: "date", Usage: "author and committer time, RFC 3339 (default: now, local zone)"},
 					&cli.StringSliceFlag{Name: "parent", Usage: "parent commit, KEY or ref:NAME; repeat for a merge, mainline first"},
+					&cli.StringFlag{Name: "change-id", Usage: "change id as `HEX`, 1-64 bytes: an identity that follows the change when the commit is rewritten"},
 					&cli.StringFlag{Name: "ref", Usage: "point reference NAME at the new commit"},
 				},
 				Action: runCommitCreate,
@@ -84,6 +87,12 @@ func runCommitCreate(c *cli.Context) error {
 	_, offset := when.Zone()
 	author.When, author.TZOffset = when.UnixNano(), offset/60
 	committer.When, committer.TZOffset = when.UnixNano(), offset/60
+	var changeID []byte
+	if s := c.String("change-id"); s != "" {
+		if changeID, err = hex.DecodeString(s); err != nil {
+			return fmt.Errorf("--change-id: %w", err)
+		}
+	}
 	refName := c.String("ref")
 	if refName != "" {
 		if err := reference.ValidateName(refName); err != nil {
@@ -99,6 +108,7 @@ func runCommitCreate(c *cli.Context) error {
 		Author:    author,
 		Committer: committer,
 		Message:   c.String("message"),
+		ChangeID:  changeID,
 	}, refName)
 	if err := errors.Join(err, closeStore(objects, refs)); err != nil {
 		return err
@@ -114,7 +124,13 @@ func createCommit(c *cli.Context, objects *packstore.Store, refs *refstore.Store
 	if err != nil {
 		return key.Key{}, err
 	}
-	if rec.Tree, err = descend(objects, root, path); err != nil {
+	target, err := descend(objects, root, path)
+	if err != nil {
+		return key.Key{}, err
+	}
+	// TREE may name a commit, as the root or through a directory entry that
+	// holds one: the new commit records that commit's tree.
+	if rec.Tree, err = fstree.DirOf(target, objects.Get); err != nil {
 		return key.Key{}, err
 	}
 	for _, spec := range c.StringSlice("parent") {
@@ -192,12 +208,29 @@ func runCommitShow(c *cli.Context) error {
 }
 
 // renderCommit prints a commit in git's cat-file layout: headers, a blank
-// line, then the message indented by four spaces.
+// line, then the message indented by four spaces. A conflicted tree shows its
+// further terms after the tree, in recorded order (remove, add, remove, …),
+// and the labels that are not empty, numbered from 0, the tree.
 func renderCommit(w io.Writer, k key.Key, c commit.Commit) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "commit %s\ntree %s\n", k, c.Tree)
+	for i, term := range c.ConflictTerms {
+		side := "remove"
+		if i%2 == 1 {
+			side = "add"
+		}
+		fmt.Fprintf(&b, "conflict-%s %s\n", side, term)
+	}
+	for i, label := range c.ConflictLabels {
+		if label != "" {
+			fmt.Fprintf(&b, "conflict-label %d %s\n", i, label)
+		}
+	}
 	for _, p := range c.Parents {
 		fmt.Fprintf(&b, "parent %s\n", p)
+	}
+	if len(c.ChangeID) > 0 {
+		fmt.Fprintf(&b, "change-id %x\n", c.ChangeID)
 	}
 	fmt.Fprintf(&b, "author %s\ncommitter %s\n", identityLine(c.Author), identityLine(c.Committer))
 	if len(c.Signature) > 0 {
@@ -217,7 +250,10 @@ func renderCommit(w io.Writer, k key.Key, c commit.Commit) error {
 func identityLine(id commit.Identity) string {
 	who := id.Name
 	if id.Email != "" {
-		who += " <" + id.Email + ">"
+		if who != "" {
+			who += " "
+		}
+		who += "<" + id.Email + ">"
 	}
 	zone := time.FixedZone("", id.TZOffset*60)
 	return who + " " + time.Unix(0, id.When).In(zone).Format(time.RFC3339)

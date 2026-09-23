@@ -23,9 +23,11 @@ import (
 type Getter func(key.Key) ([]byte, error)
 
 // Write streams a PAX tar of the directory tree rooted at root to w. root must
-// be a directory object (DirLeaf or DirNode).
+// be a directory object (DirLeaf or DirNode) or a Commit, which stands for
+// its tree; so does a commit held by a directory entry anywhere beneath. The
+// commit objects themselves are skipped: the archive holds plain directories.
 func Write(w io.Writer, root key.Key, get Getter) error {
-	if root.Type() != key.DirLeaf && root.Type() != key.DirNode {
+	if t := root.Type(); t != key.DirLeaf && t != key.DirNode && t != key.Commit {
 		return fmt.Errorf("tarexport: root %s is not a directory object (type %v)", root, root.Type())
 	}
 	tw := tar.NewWriter(w)

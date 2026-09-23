@@ -6,6 +6,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
@@ -164,5 +165,97 @@ func TestWrite_RejectsUnsafeEntryName(t *testing.T) {
 	var buf bytes.Buffer
 	if err := tarexport.Write(&buf, leaf.Key, store.Get); err == nil {
 		t.Fatalf("expected error for entry named %q", "..")
+	}
+}
+
+// untar reads a tar stream into name -> content and name -> type flag.
+func untar(t *testing.T, r io.Reader) (map[string]string, map[string]byte) {
+	t.Helper()
+	contents, types := map[string]string{}, map[string]byte{}
+	tr := tar.NewReader(r)
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			return contents, types
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(tr)
+		contents[h.Name], types[h.Name] = string(data), h.Typeflag
+	}
+}
+
+// A commit is skipped over: where a directory entry holds one, and where one
+// is the root, the archive contains the commit's tree as a plain directory.
+func TestWrite_ReadsThroughACommit(t *testing.T) {
+	store, err := packstore.Open(t.TempDir(), packstore.WithSync(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	put := func(o fstree.Object) fstree.Object {
+		t.Helper()
+		if err := store.Put(o.Key, o.Bytes); err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	leaf := func(entries ...fstree.Entry) fstree.Object {
+		t.Helper()
+		o, err := fstree.EncodeDirLeaf(entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return put(o)
+	}
+	blob := func(s string) fstree.Object {
+		t.Helper()
+		o, err := fstree.EncodeBlob([]byte(s))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return put(o)
+	}
+	ck := func(o fstree.Object) []byte { return o.Key[:] }
+	sub := leaf(fstree.Entry{Name: []byte("file"), Mode: 0o100644, ContentKey: ck(blob("inner file"))})
+	inner := leaf(
+		fstree.Entry{Name: []byte("README"), Mode: 0o100644, ContentKey: ck(blob("readme"))},
+		fstree.Entry{Name: []byte("sub"), Mode: 0o040755, ContentKey: sub.Key[:]},
+	)
+	id := commit.Identity{Name: "Ann", When: 1}
+	vendored, vendoredBytes, err := commit.Commit{Tree: inner.Key, Author: id, Committer: id, Message: "vendored"}.Object()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(vendored, vendoredBytes); err != nil {
+		t.Fatal(err)
+	}
+	top := leaf(
+		fstree.Entry{Name: []byte("main.go"), Mode: 0o100644, ContentKey: ck(blob("package main"))},
+		fstree.Entry{Name: []byte("vendor"), Mode: 0o040755, ContentKey: vendored[:]}, // a directory entry holding a commit
+	)
+
+	var buf bytes.Buffer
+	if err := tarexport.Write(&buf, top.Key, store.Get); err != nil {
+		t.Fatalf("Write(a tree that holds a commit): %v", err)
+	}
+	contents, types := untar(t, &buf)
+	if types["vendor/"] != tar.TypeDir {
+		t.Errorf("vendor/ has type %q, want a directory", types["vendor/"])
+	}
+	for name, want := range map[string]string{"main.go": "package main", "vendor/README": "readme", "vendor/sub/file": "inner file"} {
+		if contents[name] != want {
+			t.Errorf("%s = %q, want %q (archive: %v)", name, contents[name], want, contents)
+		}
+	}
+
+	buf.Reset()
+	if err := tarexport.Write(&buf, vendored, store.Get); err != nil {
+		t.Fatalf("Write(a commit): %v", err)
+	}
+	contents, _ = untar(t, &buf)
+	if contents["README"] != "readme" || contents["sub/file"] != "inner file" {
+		t.Errorf("archive of a commit = %v, want its tree", contents)
 	}
 }

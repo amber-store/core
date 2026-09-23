@@ -63,3 +63,40 @@ func TestRenderCommit(t *testing.T) {
 		t.Errorf("renderCommit:\n got: %q\nwant: %q", got, want)
 	}
 }
+
+func TestRenderCommitConflicted(t *testing.T) {
+	tree, _ := key.New(key.DirLeaf, 1, []byte{0x80})
+	remove, _ := key.NewFromHash(key.DirLeaf, 300, [32]byte{1})
+	add, _ := key.NewFromHash(key.DirNode, 70000, [32]byte{2})
+	parent, _ := key.NewFromHash(key.Commit, 7, [32]byte{1})
+	self, _ := key.NewFromHash(key.Commit, 9, [32]byte{2})
+	c := commit.Commit{
+		Tree:           tree,
+		ConflictTerms:  []key.Key{remove, add},
+		ConflictLabels: []string{"ours", "", "theirs"},
+		ChangeID:       []byte{0xab, 0xcd},
+		Parents:        []key.Key{parent},
+		Author:         commit.Identity{Name: "Ann", When: 1767323045_000000000, TZOffset: 60},
+		Committer:      commit.Identity{Email: "bot@example.com", When: 1767323045_000000000, TZOffset: 60},
+		Message:        "m",
+	}
+	var buf bytes.Buffer
+	if err := renderCommit(&buf, self, c); err != nil {
+		t.Fatal(err)
+	}
+	want := "commit " + self.String() + "\n" +
+		"tree " + tree.String() + "\n" +
+		"conflict-remove " + remove.String() + "\n" +
+		"conflict-add " + add.String() + "\n" +
+		"conflict-label 0 ours\n" +
+		"conflict-label 2 theirs\n" +
+		"parent " + parent.String() + "\n" +
+		"change-id abcd\n" +
+		"author Ann 2026-01-02T04:04:05+01:00\n" +
+		"committer <bot@example.com> 2026-01-02T04:04:05+01:00\n" +
+		"\n" +
+		"    m\n"
+	if got := buf.String(); got != want {
+		t.Errorf("renderCommit:\n got: %q\nwant: %q", got, want)
+	}
+}

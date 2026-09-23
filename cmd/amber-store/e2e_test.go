@@ -1,13 +1,20 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/amber-store/core/fstree"
+	"github.com/amber-store/core/key"
+	"github.com/amber-store/core/packstore"
 )
 
 // runApp runs the CLI with args (without the leading program name) and
@@ -338,7 +345,10 @@ func TestE2E_Commit(t *testing.T) {
 		t.Fatal(err)
 	}
 	root2 := run("ingest", "--no-progress", src)
-	c2 := run(append(slices.Clone(create), "--parent", "ref:main", "-m", "second", root2)...)
+	c2 := run(append(slices.Clone(create), "--parent", "ref:main", "--change-id", "00ff10", "-m", "second", root2)...)
+	if _, err := runApp(t, append(slices.Clone(seg), append(slices.Clone(create), "--change-id", "xyz", "-m", "bad", root2)...)...); err == nil {
+		t.Error("commit create accepted a change id that is not hex")
+	}
 	if c1 == c2 || c2 == root2 {
 		t.Fatalf("commit keys: c1 %s, c2 %s, root2 %s", c1, c2, root2)
 	}
@@ -348,7 +358,7 @@ func TestE2E_Commit(t *testing.T) {
 
 	show := run("commit", "show", "ref:main")
 	for _, want := range []string{
-		"commit " + c2, "tree " + root2, "parent " + c1,
+		"commit " + c2, "tree " + root2, "parent " + c1, "change-id 00ff10",
 		"author Ann <ann@example.com> 2026-01-02T03:04:05+01:00", "    second",
 	} {
 		if !strings.Contains(show, want) {
@@ -389,5 +399,103 @@ func TestE2E_Commit(t *testing.T) {
 		if _, err := runApp(t, append(slices.Clone(seg), args...)...); err == nil {
 			t.Errorf("%s: command succeeded", name)
 		}
+	}
+}
+
+// A directory entry may hold a commit. Every file operation reads through it
+// to the commit's tree: the commit object itself is skipped.
+func TestE2E_CommitInsideADirectory(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src) // a.txt, sub/b.txt, link
+	store := t.TempDir()
+	run := func(args ...string) string {
+		t.Helper()
+		out, err := runApp(t, append([]string{"--store", store}, args...)...)
+		if err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		return strings.TrimSpace(out)
+	}
+	root := run("ingest", "--no-progress", src)
+	vendored := run("commit", "create", "--author", "Ann <ann@example.com>", "-m", "vendored", root)
+
+	// No command builds such a tree (ingest reads a filesystem, which has no
+	// commits), so the test does, through the library.
+	raw, err := hex.DecodeString(vendored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ck, err := key.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := packstore.Open(filepath.Join(store, "packstore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainBlob, err := fstree.EncodeBlob([]byte("package main"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := fstree.EncodeDirLeaf([]fstree.Entry{
+		{Name: []byte("main.go"), Mode: 0o100644, ContentKey: mainBlob.Key[:]},
+		{Name: []byte("vendor"), Mode: 0o040755, ContentKey: ck[:]},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []fstree.Object{mainBlob, holder} {
+		if err := objects.Put(o.Key, o.Bytes); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := objects.Close(); err != nil {
+		t.Fatal(err)
+	}
+	top := holder.Key.String()
+
+	for spec, want := range map[string]string{top: "vendor", top + "/vendor": "a.txt", top + "/vendor/sub": "b.txt"} {
+		if out := run("ls", spec); !strings.Contains(out, want) {
+			t.Errorf("ls %s output %q does not mention %s", spec, out, want)
+		}
+	}
+
+	tarPath := filepath.Join(t.TempDir(), "top.tar")
+	run("export", "-o", tarPath, top)
+	f, err := os.Open(tarPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	archived := map[string]string{}
+	for tr := tar.NewReader(f); ; {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(tr)
+		archived[h.Name] = string(data)
+	}
+	if archived["vendor/a.txt"] != "alpha" || archived["vendor/sub/b.txt"] != "beta" {
+		t.Errorf("the archive does not hold the commit's tree under vendor/: %v", archived)
+	}
+
+	dest := filepath.Join(t.TempDir(), "restored")
+	run("restore", top, dest)
+	for name, want := range map[string]string{"main.go": "package main", "vendor/a.txt": "alpha", "vendor/sub/b.txt": "beta"} {
+		got, err := os.ReadFile(filepath.Join(dest, name))
+		if err != nil || string(got) != want {
+			t.Errorf("restored %s = %q, %v; want %q", name, got, err, want)
+		}
+	}
+
+	// TREE may name a commit through such an entry: the new commit records
+	// that commit's tree, not the commit.
+	regraft := run("commit", "create", "--author", "Ann <ann@example.com>", "-m", "regraft", top+"/vendor")
+	if show := run("commit", "show", regraft); !strings.Contains(show, "tree "+root) {
+		t.Errorf("commit show %q does not record the vendored commit's tree %s", show, root)
 	}
 }
