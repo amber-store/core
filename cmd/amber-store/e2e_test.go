@@ -391,3 +391,78 @@ func TestE2E_Commit(t *testing.T) {
 		}
 	}
 }
+
+func TestE2E_RefExpect(t *testing.T) {
+	store := t.TempDir()
+	ingest := func(extra string) string {
+		src := t.TempDir()
+		writeFixture(t, src)
+		if err := os.WriteFile(filepath.Join(src, "extra.txt"), []byte(extra), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := runApp(t, "--store", store, "ingest", "--no-progress", src)
+		if err != nil {
+			t.Fatalf("ingest: %v", err)
+		}
+		return strings.TrimSpace(out)
+	}
+	root1, root2 := ingest("one"), ingest("two")
+	ref := func(args ...string) (string, error) {
+		out, err := runApp(t, append([]string{"--store", store, "ref"}, args...)...)
+		return strings.TrimSpace(out), err
+	}
+	wantAt := func(want string) {
+		t.Helper()
+		if got, err := ref("get", "r"); err != nil || got != want {
+			t.Fatalf("ref get r = %q, %v; want %s", got, err, want)
+		}
+	}
+
+	if _, err := ref("set", "--expect", "none", "r", root1); err != nil {
+		t.Fatalf("create with --expect none: %v", err)
+	}
+	if _, err := ref("set", "--expect", "none", "r", root2); err == nil {
+		t.Fatal("--expect none overwrote an existing reference")
+	}
+	wantAt(root1)
+	if _, err := ref("set", "--expect", root2, "r", root2); err == nil {
+		t.Fatal("a stale --expect moved the reference")
+	}
+	wantAt(root1)
+	// A flag after the positionals is not parsed as a flag; it must fail
+	// rather than turn into an unconditional set.
+	if _, err := ref("set", "r", root2, "--expect", root2); err == nil {
+		t.Fatal("a misplaced --expect was accepted")
+	}
+	wantAt(root1)
+	// An empty expectation, a script's unset variable, must fail as well.
+	if _, err := ref("set", "--expect", "", "r", root2); err == nil {
+		t.Fatal("an empty --expect was accepted by ref set")
+	}
+	wantAt(root1)
+	if _, err := ref("set", "--expect", root1, "r", root2); err != nil {
+		t.Fatalf("set with the right --expect: %v", err)
+	}
+	wantAt(root2)
+
+	if _, err := ref("rm", "--expect", "none", "r"); err == nil {
+		t.Fatal("ref rm accepted --expect none")
+	}
+	if _, err := ref("rm", "--expect", "", "r"); err == nil {
+		t.Fatal("an empty --expect was accepted by ref rm")
+	}
+	wantAt(root2)
+	if _, err := ref("rm", "--expect", root1, "r"); err == nil {
+		t.Fatal("a stale --expect deleted the reference")
+	}
+	wantAt(root2)
+	if _, err := ref("rm", "--expect", root2, "r"); err != nil {
+		t.Fatalf("rm with the right --expect: %v", err)
+	}
+	if _, err := ref("get", "r"); err == nil {
+		t.Fatal("the reference survived ref rm")
+	}
+	if _, err := ref("set", "--expect", root1, "gone", root1); err == nil {
+		t.Fatal("--expect KEY created a reference that did not exist")
+	}
+}

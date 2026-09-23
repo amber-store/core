@@ -151,7 +151,7 @@ func createCommit(c *cli.Context, objects *packstore.Store, refs *refstore.Store
 	if err == nil {
 		var coll *gc.Collector
 		if coll, err = openCollector(c, objects, refs, gc.Options{}); err == nil {
-			err = errors.Join(putRef(coll, refs, refName, k, refRaw), coll.Close())
+			err = errors.Join(putRef(coll, refs, refName, k, refRaw, expectation{}), coll.Close())
 		}
 	}
 	if err != nil {
