@@ -51,6 +51,12 @@ func LookupEntry(dir key.Key, name []byte, get func(key.Key) ([]byte, error)) (E
 				return Entry{}, fmt.Errorf("fstree: child key in DirNode %s: %w", k, err)
 			}
 			k = ck
+		case key.Commit: // stands for its tree (dirof.go)
+			tree, err := commitTree(k, data)
+			if err != nil {
+				return Entry{}, err
+			}
+			k = tree
 		default:
 			return Entry{}, fmt.Errorf("fstree: %s is not a directory object (type %v)", k, k.Type())
 		}

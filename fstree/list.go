@@ -73,6 +73,12 @@ func listInto(out *[]Entry, k key.Key, after []byte, limit int, get func(key.Key
 			}
 		}
 		return false, nil
+	case key.Commit: // stands for its tree (dirof.go)
+		tree, err := commitTree(k, data)
+		if err != nil {
+			return false, err
+		}
+		return listInto(out, tree, after, limit, get)
 	default:
 		return false, fmt.Errorf("fstree: %s is not a directory object (type %v)", k, k.Type())
 	}

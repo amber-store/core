@@ -130,6 +130,12 @@ func collectEntries(k key.Key, get func(key.Key) ([]byte, error), out *[]Entry) 
 			}
 		}
 		return nil
+	case key.Commit: // stands for its tree (dirof.go)
+		tree, err := commitTree(k, data)
+		if err != nil {
+			return err
+		}
+		return collectEntries(tree, get, out)
 	default:
 		return fmt.Errorf("fstree: %s is not a directory object (type %v)", k, k.Type())
 	}
