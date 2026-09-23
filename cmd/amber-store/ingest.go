@@ -124,7 +124,7 @@ func runIngest(c *cli.Context, cfg *ingestConfig) error {
 			var coll *gc.Collector
 			coll, err = openCollector(c, objects, refs, gc.Options{})
 			if err == nil {
-				err = errors.Join(putRef(coll, refs, cfg.ref, root, raw), coll.Close())
+				err = errors.Join(putRef(coll, refs, cfg.ref, root, raw, expectation{}), coll.Close())
 			}
 		}
 		if err != nil {
