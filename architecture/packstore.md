@@ -4,7 +4,9 @@ The packstore keeps CAS objects in log-structured, append-only **segment**
 files. Records are the ones [amberpack.md](amberpack.md) defines; this document
 covers the directory, the index beside an active segment, and the rules that
 let any number of processes read and write one store at once. It is written so
-that a second implementation can share a store with this one. All integers are
+that a second implementation can share a store with this one; what it must
+keep to is gathered under [Rules for implementations](#rules-for-implementations),
+which also names the one layout this document does not give. All integers are
 big-endian.
 
 ## The directory
@@ -85,9 +87,9 @@ file. A file that ends in the trailer magic may be a seal that crashed before
 its rename; the whole-file scan decides. After a clean close, or while the
 owner syncs its writes, opening reads the sidecar and nothing of the data.
 Measured on the development Mac (warm cache, 4 KiB objects), opening a store
-whose active segment holds 64 MiB, 256 MiB and 1 GiB took 24, 45 and 197 ms
-when every open scanned the data; see `CLAUDE.md` for the figures with the
-sidecar.
+whose active segment holds 64 MiB, 256 MiB and 1 GiB took 13, 52 and 197 ms
+when every open scanned the data, and 1.6, 6.2 and 29 ms with the sidecar;
+`CLAUDE.md` has the whole table.
 
 A reader never modifies either file. Only the owner truncates a torn tail,
 finishes a crashed seal or rewrites the sidecar, and it does so when it takes
@@ -151,11 +153,33 @@ last listing, and no active segment this store reads has changed size
 A modification time proves this only if it was at least two seconds old when
 the directory was listed. On a filesystem with coarse timestamps a segment
 created in the same tick as the listing would otherwise go unnoticed for good.
+So for two seconds after any change to the directory every lookup that finds
+nothing lists it; the few microseconds `CLAUDE.md` reports for such a lookup
+are the steady state.
+
+A refresh takes effect whole or not at all. One that fails half way — a new
+segment it cannot read, say — leaves the view as it was, including how far it
+had read into other writers' segments: a position that moved on without the
+entries it passed would lose them for good. And if something the refresh
+listed is gone when it comes to open it, the listing is out of date: what that
+segment held may be in one created since, a compaction's copy or a seal's new
+name. The refresh then lists again, up to three times, rather than settle for
+a view with a hole in it.
 
 The write path's duplicate check does not look again. A duplicate it fails to
 see costs a redundant record, which compaction folds; a directory listing for
 every new object would cost every ingest dearly. A bulk "which of these are
 missing" call looks once, up front.
+
+**A write relies only on what is durable.** A store that syncs its writes
+counts a record in another writer's active segment as a duplicate only as far
+as that writer has synced it, which the `synced` entries of the sidecar tell:
+its own fsync covers its own segment alone, and acknowledging a write against
+bytes somebody else has yet to sync would promise what nobody has delivered.
+Otherwise it writes a copy of its own, which compaction folds later.
+Compaction applies the same rule to survivors: a copy a live writer has yet to
+sync does not excuse deleting a segment that holds a synced one. Reads report
+what is visible: `Has`, `Get` and `Missing` wait for nobody's fsync.
 
 A read from another writer's active segment checks that the record at the
 indexed offset carries the key and length the index named; if not, the view is
@@ -190,14 +214,29 @@ for the lock is polling with a back-off of at most 50 ms; a process that just
 swept leaves the lock alone for 100 ms before sweeping again, or a writer
 polling from elsewhere could be starved by back-to-back sweeps.
 
+**Spans nest.** A span that finds another span of its store in flight joins it
+without waiting, even while a sweep of that store is waiting for the spans to
+end: the inner span may be the outer one's own work, a write inside a
+bracketed span, and the two would otherwise wait for each other. A sweep
+therefore starts at a moment with no span in flight. A process that writes
+without pause from many goroutines and also sweeps quiesces its writers
+itself, as the collector does with its reference lock.
+
 **The view generation.** The first 8 bytes of `gc.lock` are a counter. Whoever
-held the lock exclusively increments it before letting go (it is not fsynced:
-it only has to outlive the processes that are running). A store remembers the
-generation it opened at, read before its first look at the directory. Each
-time it takes the shared lock it reads the counter, and if it moved it lists
-the directory again **before anything else**. Without this, a store that still
-maps a reaped segment would skip an object as a duplicate of a record that is
-gone.
+takes the lock exclusively reads the counter **under the lock**, writes one
+more, and only then deletes anything (it is not fsynced: it only has to
+outlive the processes that are running). Counting from the file matters: a
+store that added one to the value it remembered would, after another store's
+sweep, write the current value again, and nobody would notice. Writing before
+deleting matters: a sweeper that dies half way has still told everyone. A
+store that cannot write the counter does not sweep.
+
+Each time a store takes the shared lock it reads the counter, and if it moved
+it lists the directory again **before anything else**. It also does so on its
+first write span, whatever the counter says: it may have opened in the middle
+of a sweep and listed a directory that was about to change. Without this, a
+store that still maps a reaped segment would skip an object as a duplicate of
+a record that is gone.
 
 **What a cycle sees.** Having taken the exclusive lock, the collector lists
 the directory; from then on its view is complete and stable. Its mark set
@@ -207,12 +246,55 @@ store, whose segments never fill, still gets collected; a segment a live
 writer holds is left alone, and an active segment is never a victim.
 
 Objects written by another process and not yet named by a reference when a
-cycle starts are protected by the grace period alone, as they are in git and
-jj. A writer that wants more brackets its ingest and its reference put in one
-write span.
+cycle starts are protected by the grace period alone. (git has a second
+defence that this store lacks: a write that finds its object already present
+freshens the file's time. Here a duplicate of a dead record in an old segment
+gets no new grace. What catches a reaped object is the completeness walk of
+the reference put that follows, which fails.) A writer that wants more
+brackets its writes and the reference put that names them in one write span.
+In a process that runs a collector that is `gc.Collector.BeginSpan`, which
+takes the collector's reference lock before the gate, the order a cycle takes
+them in ([mark-sweep-gc.md](mark-sweep-gc.md#across-processes)).
 
 `Wipe` refuses, deleting nothing, while another store owns an active segment:
 that writer would go on appending to a file that is gone.
+
+## Rules for implementations
+
+What another implementation sharing a store has to keep to, beyond the layouts
+above:
+
+- **Records start at byte 8** of a segment, after the header magic, and are
+  contiguous.
+- **A record before its sidecar entry, a `synced` entry only after fsync
+  returned**, and the sidecar itself is never synced.
+- **Own a segment before writing to it**: the non-blocking exclusive `flock`
+  on the data file. Create one under its temporary name, exclusively, lock
+  it, **then check that the locked file is still the one at that name** (same
+  device and inode), and that no segment has the id; whoever clears away
+  stale temporaries makes the same check after taking their lock.
+- **Never convert the gate's lock**, count the generation from the file and
+  write it before deleting anything, and refresh on a moved generation and on
+  the first span, as [above](#the-gate-writers-against-a-sweep).
+- **Survivors are durable before victims are unlinked**: a compaction syncs
+  the segment it copied into, then removes the old ones, then syncs the
+  directory.
+- **Rely only on durable copies** when skipping a write or a survivor's copy.
+
+The **sealed footer** (index section, filter, trailer) is older than this
+document and is not laid out here yet; `packstore/footer.go` is the reference.
+
+## Known limits
+
+- A process that is stopped while it holds `gc.lock` stalls every writer.
+  There is no timeout and no diagnostic.
+- A sweeper waits for as long as other processes' write spans overlap; nothing
+  bounds that wait.
+- A sidecar is not bound to the identity of its data file. A release from
+  before sidecars that truncated a segment and grew it again under the same
+  id would leave a stale sidecar that could still look plausible. Reads from
+  another writer's segment check the record's key and would notice; reads
+  from a store's own segment do not.
 
 ## Compatibility
 

@@ -209,7 +209,16 @@ func runRefRm(c *cli.Context) error {
 // one-shot CLI is); the read-old → prepare → put → release sequence is not
 // atomic against a concurrent writer of the same name. With an expectation
 // the store itself refuses the write if the reference moved meanwhile.
-func putRef(coll *gc.Collector, refs *refstore.Store, name string, root key.Key, raw []byte, exp expectation) error {
+// refGate is what a reference put needs from the collector: the completeness
+// walk under the reference lock. A *gc.Collector opens a span for the one
+// put; a *gc.Span is a span already open around the writes the reference
+// names.
+type refGate interface {
+	PrepareRef(root key.Key) (commit, abort func(), err error)
+	ReleaseRef(root key.Key) error
+}
+
+func putRef(coll refGate, refs *refstore.Store, name string, root key.Key, raw []byte, exp expectation) error {
 	var old *key.Key
 	if prev, err := refs.Get(name); err == nil {
 		prevRef, err := reference.Decode(prev)

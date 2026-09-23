@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/amber-store/core/key"
 	"golang.org/x/sys/unix"
@@ -203,8 +204,8 @@ func (s *Store) createActive(maxID uint64) error {
 			err = s.dirF.Sync()
 		}
 		if err != nil {
+			os.Remove(final) // while the lock still holds: nobody may adopt a segment that is on its way out
 			abandon()
-			os.Remove(final)
 			return err
 		}
 		sc, _ := createSidecar(final + sidecarSuffix) // nil on failure: a segment works without one
@@ -295,6 +296,10 @@ func (s *Store) sealIdleLocked() error {
 		s.mu.Lock()
 		s.structEpoch++
 		s.active = nil
+		// The segment is now neither this store's nor in its view of the
+		// others', and whoever takes it next changes nothing in the
+		// directory: the next lookup that misses has to list it.
+		s.dirMtime = time.Time{}
 		s.mu.Unlock()
 	}
 	ls, err := listSegments(s.dir)

@@ -118,13 +118,25 @@ the barrier exactly as described above.
 - The sweep seals the active segments no writer holds, besides the
   collector's own, so that a small store, whose segments never fill, still
   gets collected. A segment held by a live writer is left alone.
-- Whoever held the gate exclusively bumps a generation in `gc.lock`. A store
-  that finds it moved lists the directory before its next duplicate check,
-  which could otherwise hit a record in a segment that was reaped under it.
+- Whoever takes the gate exclusively moves a generation in `gc.lock` on,
+  counting from the file, before it deletes anything. A store that finds it
+  moved, and any store on its first write span, lists the directory before its
+  next duplicate check, which could otherwise hit a record in a segment that
+  was reaped under it.
 - Objects written by another process and not yet referenced when a cycle
   starts are protected by the grace period alone. A writer that wants more
-  brackets its ingest and the reference PUT in one `packstore.BeginWrite`
-  span, as `amber-store ingest --ref` does.
+  brackets its writes and the reference PUT in one span,
+  `Collector.BeginSpan`, as `amber-store ingest --ref` and `commit create
+  --ref` do. The span takes the reference lock and then the gate, the order a
+  cycle takes them in, and prepares references without taking either again
+  (`Span.PrepareRef`). A `packstore.BeginWrite` span held across
+  `Collector.PrepareRef` takes them the other way round and can deadlock
+  against a cycle of the same process.
+- Spans nest: a write inside an open span never waits for a sweep that is
+  waiting for that span.
+- `Status` looks at the store directory again before its advisory mark. The
+  references it marks from are everybody's; the view of the objects is its
+  own store's, as of that store's last look.
 - A store that just swept leaves the gate alone for 100 ms before sweeping
   again; back-to-back sweeps would otherwise starve a writer that polls for
   the lock from another process.

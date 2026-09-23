@@ -60,6 +60,7 @@ type dirListing struct {
 	sealed, active map[uint64]segFile
 	tmp, sidecars  []string // file names
 	maxID          uint64   // highest segment id of any kind
+	vanished       bool     // a name was gone again before it could be looked at: the listing is out of date
 }
 
 func listSegments(dir string) (dirListing, error) {
@@ -95,7 +96,8 @@ func listSegments(dir string) (dirListing, error) {
 		}
 		info, err := e.Info()
 		if errors.Is(err, fs.ErrNotExist) {
-			continue // sealed, reaped or renamed since the listing
+			ls.vanished = true // sealed, reaped or renamed since the directory was read
+			continue
 		}
 		if err != nil {
 			return ls, err
@@ -141,35 +143,38 @@ func openForeign(id uint64, sf segFile) (*foreignActive, *sealedSegment, error) 
 }
 
 // poll reads what the segment's owner appended since the view last looked
-// and returns the entries to add. ok is false when the view has to be built
-// again. The index is not touched: the caller extends it under the store's
-// lock.
-func (fa *foreignActive) poll() (added []sidecarRec, size int64, ok bool, err error) {
+// and returns the entries to add and how far it read. ok is false when the
+// view has to be built again. The view itself is not touched: the caller
+// commits entries and position together under the store's lock, or, when the
+// refresh fails on something else, neither — a position that moved on without
+// its entries would lose them for good.
+func (fa *foreignActive) poll() (added []sidecarRec, next segmentScan, size int64, ok bool, err error) {
 	var tail []byte
 	sf, err := os.Open(fa.path + sidecarSuffix)
 	switch {
 	case errors.Is(err, fs.ErrNotExist): // no sidecar, or gone with a seal: the data's tail still reads
 	case err != nil:
-		return nil, 0, false, err
+		return nil, segmentScan{}, 0, false, err
 	default:
 		defer sf.Close()
 		st, err := sf.Stat()
 		if err != nil {
-			return nil, 0, false, err
+			return nil, segmentScan{}, 0, false, err
 		}
 		if st.Size() < fa.scan.sidecarEnd {
-			return nil, 0, false, nil // started over by a new owner
+			return nil, segmentScan{}, 0, false, nil // started over by a new owner
 		}
 		if tail, err = readRange(sf, fa.scan.sidecarEnd, st.Size()-fa.scan.sidecarEnd); err != nil {
-			return nil, 0, false, err
+			return nil, segmentScan{}, 0, false, err
 		}
 	}
 	st, err := fa.f.Stat() // after the sidecar: the data covers whatever it speaks of
 	if err != nil {
-		return nil, 0, false, err
+		return nil, segmentScan{}, 0, false, err
 	}
-	added, _, ok, err = fa.scan.advance(fa.f, st.Size(), tail)
-	return added, st.Size(), ok, err
+	next = *fa.scan // a copy moves on, not the view's: the index is only read
+	added, _, ok, err = next.advance(fa.f, st.Size(), tail)
+	return added, next, st.Size(), ok, err
 }
 
 // read returns the stored payload of the record loc names, after checking
@@ -250,12 +255,22 @@ func (s *Store) viewIsCurrent() bool {
 	return true
 }
 
+// Refresh brings the store's view of the directory up to date: the segments
+// other stores sealed, created or reaped, and what they appended. Lookups do
+// it by themselves when they find nothing. A caller that is about to work
+// from a snapshot of the view, as gc's advisory mark does, asks for it.
+func (s *Store) Refresh() error { return s.refresh() }
+
 // refresh brings the view up to date unconditionally.
 func (s *Store) refresh() error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	return s.refreshLocked(false)
 }
+
+// maxRelist bounds how often one refresh lists the directory, when what it
+// listed keeps vanishing under it.
+const maxRelist = 3
 
 // refreshLocked re-lists the directory and brings the view in line: sealed
 // segments that appeared are mapped, those that vanished or were replaced
@@ -287,28 +302,21 @@ func (s *Store) refreshLocked(rebuild bool) error {
 	}
 	s.mu.RUnlock()
 
-	// The directory's time before its listing: a change that falls between
-	// the two then shows as a time this view has not caught up with.
-	dirInfo, err := os.Stat(s.dir)
-	if err != nil {
-		return err
-	}
-	listedAt := time.Now()
-	ls, err := listSegments(s.dir)
-	if err != nil {
-		return err
-	}
 	type delta struct {
 		fa    *foreignActive
 		added []sidecarRec
+		scan  segmentScan // how far the poll read: committed with the entries
 		size  int64
 	}
 	var (
+		dirInfo       os.FileInfo
+		listedAt      time.Time
+		ls            dirListing
 		opened        []*sealedSegment
 		openedForeign []*foreignActive
 		deltas        []delta
-		keepSealed    = map[uint64]bool{}
-		keepForeign   = map[uint64]bool{}
+		keepSealed    map[uint64]bool
+		keepForeign   map[uint64]bool
 	)
 	discard := func() {
 		for _, g := range opened {
@@ -317,53 +325,89 @@ func (s *Store) refreshLocked(rebuild bool) error {
 		for _, fa := range openedForeign {
 			fa.f.Close()
 		}
+		opened, openedForeign, deltas = nil, nil, nil
 	}
-	for id, sf := range ls.sealed {
-		if g := have[id]; g != nil && os.SameFile(g.fi, sf.info) {
-			keepSealed[id] = true
-			continue
-		}
-		seg, err := openSealed(sf.path, id)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue // reaped between the listing and now
-		}
-		if err != nil {
-			discard()
+	for attempt := 1; ; attempt++ {
+		keepSealed, keepForeign = map[uint64]bool{}, map[uint64]bool{}
+		// The directory's time before its listing: a change that falls
+		// between the two then shows as a time this view has not caught up
+		// with.
+		var err error
+		if dirInfo, err = os.Stat(s.dir); err != nil {
 			return err
 		}
-		opened = append(opened, seg)
-	}
-	for id, sf := range ls.active {
-		if hasOwn && id == own {
-			continue
+		listedAt = time.Now()
+		if ls, err = listSegments(s.dir); err != nil {
+			return err
 		}
-		if g := have[id]; g != nil && os.SameFile(g.fi, sf.info) {
-			keepSealed[id] = true // a crashed seal, mapped under its active name
-			continue
+		if s.afterList != nil {
+			s.afterList()
 		}
-		if fa := haveForeign[id]; fa != nil && !rebuild && os.SameFile(fa.fi, sf.info) {
-			added, size, ok, err := fa.poll()
+		vanished := ls.vanished
+		for id, sf := range ls.sealed {
+			if g := have[id]; g != nil && os.SameFile(g.fi, sf.info) {
+				keepSealed[id] = true
+				continue
+			}
+			seg, err := openSealed(sf.path, id)
+			if errors.Is(err, fs.ErrNotExist) {
+				vanished = true // reaped between the listing and now
+				continue
+			}
 			if err != nil {
 				discard()
 				return err
 			}
-			if ok {
-				keepForeign[id] = true
-				deltas = append(deltas, delta{fa, added, size})
+			opened = append(opened, seg)
+		}
+		for id, sf := range ls.active {
+			if hasOwn && id == own {
 				continue
 			}
+			if g := have[id]; g != nil && os.SameFile(g.fi, sf.info) {
+				keepSealed[id] = true // a crashed seal, mapped under its active name
+				continue
+			}
+			if fa := haveForeign[id]; fa != nil && !rebuild && os.SameFile(fa.fi, sf.info) {
+				added, next, size, ok, err := fa.poll()
+				if errors.Is(err, os.ErrClosed) {
+					// This store took the segment for its own, or sealed
+					// it, under this refresh (dropForeignLocked). The epoch
+					// moved with that, so this round drops nothing.
+					continue
+				}
+				if err != nil {
+					discard()
+					return err
+				}
+				if ok {
+					keepForeign[id] = true
+					deltas = append(deltas, delta{fa, added, next, size})
+					continue
+				}
+			}
+			fa, seg, err := openForeign(id, sf)
+			if err != nil {
+				discard()
+				return err
+			}
+			switch {
+			case seg != nil:
+				opened = append(opened, seg)
+			case fa != nil:
+				openedForeign = append(openedForeign, fa)
+			default:
+				vanished = true // sealed or reaped between the listing and now
+			}
 		}
-		fa, seg, err := openForeign(id, sf)
-		if err != nil {
-			discard()
-			return err
+		// Something listed was gone when it came to be opened, so the
+		// listing is out of date, and what the missing segment held may be
+		// in one created since: a compaction's copy, a seal's new name. Look
+		// again rather than settle for a view with a hole in it.
+		if !vanished || attempt == maxRelist {
+			break
 		}
-		switch {
-		case seg != nil:
-			opened = append(opened, seg)
-		case fa != nil:
-			openedForeign = append(openedForeign, fa)
-		}
+		discard()
 	}
 
 	s.mu.Lock()
@@ -402,6 +446,7 @@ func (s *Store) refreshLocked(rebuild bool) error {
 		for _, r := range d.added {
 			d.fa.scan.index[r.k] = r.loc()
 		}
+		d.fa.scan.pos, d.fa.scan.sidecarEnd, d.fa.scan.durable = d.scan.pos, d.scan.sidecarEnd, d.scan.durable
 		d.fa.seenSize = d.size
 	}
 	s.dirMtime, s.listedAt = dirInfo.ModTime(), listedAt

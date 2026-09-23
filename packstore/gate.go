@@ -49,11 +49,24 @@ const (
 // dropped in between, and another process may take it — so the gate never
 // converts: exclusive is taken and dropped only with no local span in flight.
 //
-// Whoever held the lock exclusively bumps the generation before letting go.
-// A store that takes the shared lock and finds the generation moved looks at
-// the directory again before it does anything else: it may still have a
-// reaped segment mapped, and its duplicate check would find objects there
-// that are gone.
+// Whoever takes the lock exclusively moves the generation on first: it reads
+// the counter under the lock, writes one more, and only then deletes
+// anything, so a sweep that dies half way has still told everyone. A store
+// counts from the file, not from the value it remembers: another store may
+// have swept since it looked. A store that takes the shared lock and finds
+// the generation moved looks at the directory again before it does anything
+// else: it may still have a reaped segment mapped, and its duplicate check
+// would find objects there that are gone. So does a store on its first span,
+// whatever the counter says: it may have opened in the middle of a sweep and
+// listed a directory that was about to change.
+//
+// Spans nest. A span that finds another in flight joins it without waiting,
+// even when a sweep of this store is waiting for the spans to end: the inner
+// span may be the outer one's own work — a Put inside a BeginWrite bracket —
+// and the two would wait for each other. A sweep therefore starts at a moment
+// with no span in flight; a caller that writes without pause from many
+// goroutines, and sweeps in the same process, quiesces its writers itself, as
+// the collector does with its reference lock.
 type gate struct {
 	f       *os.File
 	refresh func() error // brings the store's view up to date
@@ -67,10 +80,11 @@ type gate struct {
 	busy      bool      // one goroutine is changing the file lock's state; the others wait
 	blocked   bool      // new local spans wait: a sweep is coming, going, or at work
 	gen       uint64    // the generation this store's view is good for
+	looked    bool      // the view was brought up to date under the file lock at least once
 	sweptAt   time.Time // when this store last dropped the exclusive lock
 	closed    bool
 
-	ignoreGeneration bool // test hook: reproduces the loss the generation prevents
+	neverRefresh bool // test hook: spans never refresh the view, which reproduces the losses that prevents
 }
 
 func openGate(dir string, refresh func() error) (*gate, error) {
@@ -80,12 +94,6 @@ func openGate(dir string, refresh func() error) (*gate, error) {
 	}
 	g := &gate{f: f, refresh: refresh, done: make(chan struct{})}
 	g.cond = sync.NewCond(&g.mu)
-	// Before the first look at the directory: a sweep that falls in between
-	// then shows as a generation the view has yet to catch up with.
-	if g.gen, err = g.generation(); err != nil {
-		f.Close()
-		return nil, err
-	}
 	return g, nil
 }
 
@@ -99,6 +107,22 @@ func (g *gate) generation() (uint64, error) {
 		return 0, nil // never swept
 	}
 	return binary.BigEndian.Uint64(b[:]), nil
+}
+
+// bump moves the generation on, counting from what the file holds, and
+// returns the new value. The caller holds the file lock exclusively. A store
+// that cannot write it must not sweep: nobody would learn of it.
+func (g *gate) bump() (uint64, error) {
+	gen, err := g.generation()
+	if err != nil {
+		return 0, err
+	}
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], gen+1)
+	if _, err := g.f.WriteAt(b[:], 0); err != nil { // not synced: it only has to outlive the processes that are running
+		return 0, fmt.Errorf("packstore: %s: %w", gateFile, err)
+	}
+	return gen + 1, nil
 }
 
 // poll takes the file lock in the given mode, trying without blocking so
@@ -148,11 +172,13 @@ func (g *gate) waitLocked(ctx context.Context, ok func() bool) error {
 	return nil
 }
 
-// beginShared opens a write span.
+// beginShared opens a write span. It waits for a sweep of this store that is
+// coming, going or at work — unless a span is in flight already, which it
+// then joins (see the type's comment).
 func (g *gate) beginShared() error {
 	ctx := context.Background()
 	g.mu.Lock()
-	if err := g.waitLocked(ctx, func() bool { return !g.busy && !g.blocked }); err != nil {
+	if err := g.waitLocked(ctx, func() bool { return !g.busy && (!g.blocked || g.shared > 0) }); err != nil {
 		g.mu.Unlock()
 		return err
 	}
@@ -167,7 +193,7 @@ func (g *gate) beginShared() error {
 	err := g.poll(ctx, unix.LOCK_SH)
 	gen := uint64(0)
 	if err == nil {
-		if gen, err = g.generation(); err == nil && gen != g.gen && !g.ignoreGeneration {
+		if gen, err = g.generation(); err == nil && (gen != g.gen || !g.looked) && !g.neverRefresh {
 			err = g.refresh() // before any span proceeds to a duplicate check
 		}
 		if err != nil {
@@ -177,7 +203,7 @@ func (g *gate) beginShared() error {
 	g.mu.Lock()
 	g.busy = false
 	if err == nil {
-		g.flocked, g.shared, g.gen = true, 1, gen
+		g.flocked, g.shared, g.gen, g.looked = true, 1, gen, true
 	}
 	g.cond.Broadcast()
 	g.mu.Unlock()
@@ -222,18 +248,26 @@ func (g *gate) beginExclusive(ctx context.Context) (end func(), err error) {
 	g.mu.Unlock()
 
 	err = g.poll(ctx, unix.LOCK_EX)
+	gen := uint64(0)
+	if err == nil {
+		// The generation first, before anything can be deleted; then the
+		// view, before this store's own spans are let in again: they run
+		// their duplicate checks against it.
+		if gen, err = g.bump(); err == nil {
+			err = g.refresh()
+		}
+		if err != nil {
+			g.unlock()
+		}
+	}
 	g.mu.Lock()
 	g.busy, g.blocked = false, false
 	if err == nil {
-		g.exclusive = 1
+		g.exclusive, g.gen, g.looked = 1, gen, true
 	}
 	g.cond.Broadcast()
 	g.mu.Unlock()
 	if err != nil {
-		return nil, err
-	}
-	if err := g.refresh(); err != nil {
-		g.endExclusive()
 		return nil, err
 	}
 	return g.endExclusive, nil
@@ -256,10 +290,6 @@ func (g *gate) endExclusive() {
 	for g.shared > 0 && !g.closed {
 		g.cond.Wait()
 	}
-	var b [8]byte
-	g.gen++
-	binary.BigEndian.PutUint64(b[:], g.gen)
-	g.f.WriteAt(b[:], 0) // not synced: it only has to outlive the processes that are running
 	g.unlock()
 	g.exclusive, g.blocked, g.sweptAt = 0, false, time.Now()
 	g.cond.Broadcast()
@@ -324,8 +354,14 @@ func (g *gate) close() error {
 // sweep. Every exported write opens one itself; callers bracket larger spans
 // that must not straddle a sweep, such as a completeness walk followed by a
 // reference put. If another store has swept since this one last looked, the
-// view is refreshed before BeginWrite returns. Spans nest and cost nothing
-// extra while one is open.
+// view is refreshed before BeginWrite returns. Spans nest: a write, or another
+// BeginWrite, inside an open span joins it at no cost and never waits.
+//
+// A process that also runs a gc.Collector on this store opens its spans
+// through the collector (Collector.BeginSpan), which takes its reference lock
+// before this gate, the order a cycle takes them in. A span opened here and
+// held across Collector.PrepareRef takes them the other way round, and the
+// two can wait for each other.
 func (s *Store) BeginWrite() (done func(), err error) {
 	if err := s.gate.beginShared(); err != nil {
 		return nil, err
@@ -338,10 +374,11 @@ func (s *Store) BeginWrite() (done func(), err error) {
 // spans and every other store's to end, keeps other stores' writers out
 // until done is called, and refreshes the view, which is then complete and
 // stable. This store's own writers go on: the write barrier and the
-// collector's reference lock are what holds them where needed. done bumps
-// the view generation, so that every other store looks at the directory
-// again before its next write. Compact, Wipe and Remove take the gate
-// themselves; inside a BeginSweep they find it held.
+// collector's reference lock are what holds them where needed. The view
+// generation moves as soon as the lock is taken, so that every other store
+// looks at the directory again before its next write, even if this process
+// dies half way. Compact, Wipe and Remove take the gate themselves; inside a
+// BeginSweep they find it held.
 func (s *Store) BeginSweep(ctx context.Context) (done func(), err error) {
 	if err := s.gate.yield(ctx); err != nil {
 		return nil, err

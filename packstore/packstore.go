@@ -59,7 +59,8 @@ func WithSync(b bool) Option {
 	return func(c *config) { c.sync = b }
 }
 
-// activeSegment is the single append-only segment accepting writes.
+// activeSegment is the append-only segment this store owns and writes to.
+// Other stores on the directory own theirs (active.go).
 type activeSegment struct {
 	id    uint64
 	path  string
@@ -125,9 +126,11 @@ type Store struct {
 
 	// refreshSeq counts refreshes of the view, so that a lookup that waited
 	// for one does not repeat it; refreshes counts them for tests.
-	refreshMu  sync.Mutex
-	refreshSeq atomic.Uint64
-	refreshes  atomic.Int64
+	refreshMu   sync.Mutex
+	refreshSeq  atomic.Uint64
+	refreshes   atomic.Int64
+	afterList   func() // test hook: runs when a refresh has listed the directory, before it opens anything
+	afterDetach func() // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
 
 	gate *gate // gc.lock: writers against a sweep, across processes (gate.go)
 }
@@ -413,7 +416,7 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 		}
 		seen[obj.Key] = struct{}{}
 		s.observe(obj.Key)
-		has, err := s.hasLocal(obj.Key)
+		has, err := s.hasDurably(obj.Key)
 		if err != nil {
 			return fail(fmt.Errorf("exists (%s): %w", obj.Key, err))
 		}
@@ -448,7 +451,7 @@ func (s *Store) Put(k key.Key, data []byte) error {
 		return failed
 	}
 	s.observe(k)
-	has, err := s.hasLocal(k)
+	has, err := s.hasDurably(k)
 	if err != nil {
 		return err
 	}
@@ -687,11 +690,51 @@ func (s *Store) Has(k key.Key) (bool, error) {
 	return has, err
 }
 
-// hasLocal is Has without the second look: what this store's view holds. The
-// write path checks for duplicates with it. A duplicate it fails to see —
-// written by another store a moment ago — costs a redundant record, which
-// compaction folds; listing the directory for every new object would cost
-// every ingest dearly.
+// hasDurably is the write path's duplicate check: whether the view holds a
+// copy of k that a write may rely on instead of making one. It does not look
+// at the directory again. A duplicate it fails to see — written by another
+// store a moment ago — costs a redundant record, which compaction folds;
+// listing the directory for every new object would cost every ingest dearly.
+func (s *Store) hasDurably(k key.Key) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return false, ErrClosed
+	}
+	if s.reliableActiveLocked(k) {
+		return true, nil
+	}
+	for i := len(s.sealed) - 1; i >= 0; i-- {
+		if s.sealed[i].has(k) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// reliableActiveLocked reports whether an active segment holds a copy of k
+// that a write, or a compaction, may rely on instead of making its own. A
+// record in another store's segment counts only as far as its owner has
+// synced it, when this store syncs: this store's fsync covers its own segment
+// alone, and acknowledging a write against bytes somebody else has yet to
+// sync would promise what nobody has delivered. The price is a second copy
+// now and then. The caller holds mu.
+func (s *Store) reliableActiveLocked(k key.Key) bool {
+	if s.active != nil {
+		if _, ok := s.active.index[k]; ok {
+			return true // this store's own fsync covers it
+		}
+	}
+	for _, fa := range s.foreign {
+		if loc, ok := fa.scan.index[k]; ok && (!s.cfg.sync || loc.off+amberpack.RecHeaderSize+int64(loc.slen) <= fa.scan.durable) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasLocal is Has without the second look: what this store's view holds,
+// synced or not. Reads ask it; writes ask hasDurably.
 func (s *Store) hasLocal(k key.Key) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

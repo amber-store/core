@@ -231,7 +231,7 @@ func (s *Store) copyLive(victims []*sealedSegment, live func(key.Key) bool, pace
 	survivorHas := func(k key.Key) bool {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		if _, _, _, ok := s.activeLookupLocked(k); ok {
+		if s.reliableActiveLocked(k) { // not a copy a live writer has yet to sync: the victim's may be the durable one
 			return true
 		}
 		for _, g := range s.sealed {
@@ -313,6 +313,13 @@ func (s *Store) removeVictims(victims []*sealedSegment, stats *CompactStats) err
 	for _, g := range victims {
 		victimID[g.id] = true
 	}
+	// A lookup that finds nothing lists the directory (view.go). Between the
+	// victims leaving the view and leaving the directory, such a listing
+	// would map them again, and the duplicate check would go on finding what
+	// is gone. No listing runs in between: refreshMu is held. Unlinking does
+	// not have to wait for scrubs, only unmapping does — and must not wait
+	// here: a scrub's callback may be waiting for refreshMu.
+	s.refreshMu.Lock()
 	s.mu.Lock()
 	// Fresh slice: never mutate an array a concurrent reader may still
 	// hold (same discipline as Remove).
@@ -324,24 +331,30 @@ func (s *Store) removeVictims(victims []*sealedSegment, stats *CompactStats) err
 	}
 	s.sealed = kept
 	s.mu.Unlock()
-	s.waitScrubs() // in-flight scrub walks may still read the victims' mmaps
-
+	if s.afterDetach != nil {
+		s.afterDetach()
+	}
 	var firstErr error
 	for _, g := range victims {
-		stats.BytesFreed += uint64(len(g.mm))
-		if err := g.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
 		if err := os.Remove(g.path); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	stats.SegmentsCompacted = len(victims)
 	if s.cfg.sync {
 		if err := s.dirF.Sync(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	s.refreshMu.Unlock()
+
+	s.waitScrubs() // in-flight scrub walks may still read the victims' mmaps
+	for _, g := range victims {
+		stats.BytesFreed += uint64(len(g.mm))
+		if err := g.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	stats.SegmentsCompacted = len(victims)
 	return firstErr
 }
 

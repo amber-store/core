@@ -9,7 +9,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/key"
 	"golang.org/x/sys/unix"
 )
@@ -300,11 +299,13 @@ func TestLongLivedReaderSurvivesSealAndCompaction(t *testing.T) {
 
 func TestDedupDoesNotRefresh(t *testing.T) {
 	s := openStore(t, t.TempDir(), WithSync(false))
+	objs := testObjects(t, 61)
+	putAll(t, s, objs[60:]) // a store's first write span looks at the directory once: it may have opened during a sweep (gate.go)
 	before := s.refreshes.Load()
-	if err := s.WriteBatch(objSeq(testObjects(t, 50), -1)); err != nil {
+	if err := s.WriteBatch(objSeq(objs[:50], -1)); err != nil {
 		t.Fatal(err)
 	}
-	putAll(t, s, testObjects(t, 60)[50:])
+	putAll(t, s, objs[50:60])
 	if got := s.refreshes.Load(); got != before {
 		t.Fatalf("writing new objects listed the directory %d times; the duplicate check must not", got-before)
 	}
@@ -342,7 +343,6 @@ func TestForeignReadNeverReturnsTheWrongRecord(t *testing.T) {
 	if got, err := reader.Get(o.Key); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("Get = %d bytes, %v; want ErrCorrupt", len(got), err)
 	}
-	_ = amberpack.RecHeaderSize
 }
 
 func TestWipeRefusesWhileAnotherStoreOwnsASegment(t *testing.T) {

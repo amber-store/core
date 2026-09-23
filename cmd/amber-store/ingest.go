@@ -2,14 +2,12 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"sync"
 	"time"
 
-	"github.com/amber-store/core/gc"
 	"github.com/amber-store/core/ingest"
 	"github.com/amber-store/core/reference"
 	"github.com/urfave/cli/v2"
@@ -112,14 +110,14 @@ func runIngest(c *cli.Context, cfg *ingestConfig) error {
 	// cycle in another process cannot fall between the two and find objects
 	// whose reference is still to come, which only the grace period would
 	// protect.
-	endSpan, err := objects.BeginWrite()
+	span, err := openSpan(c, objects, refs, cfg.ref != "")
 	if err != nil {
 		closeStore(objects, refs)
 		return err
 	}
 	root, _, err := ingest.Dir(objects, path, opts)
 	if err != nil {
-		endSpan()
+		span.end()
 		closeStore(objects, refs)
 		return err
 	}
@@ -131,20 +129,19 @@ func runIngest(c *cli.Context, cfg *ingestConfig) error {
 		}
 		raw, err := rec.Encode()
 		if err == nil {
-			var coll *gc.Collector
-			coll, err = openCollector(c, objects, refs, gc.Options{})
-			if err == nil {
-				err = errors.Join(putRef(coll, refs, cfg.ref, root, raw, expectation{}), coll.Close())
-			}
+			err = putRef(span.refs, refs, cfg.ref, root, raw, expectation{})
 		}
 		if err != nil {
-			endSpan()
+			span.end()
 			closeStore(objects, refs)
 			return fmt.Errorf("tree stored (root %s) but creating reference %q failed: %w\nretry with: amber-store ref set %q %s",
 				root, cfg.ref, err, cfg.ref, root)
 		}
 	}
-	endSpan()
+	if err := span.end(); err != nil {
+		closeStore(objects, refs)
+		return err
+	}
 	if err := closeStore(objects, refs); err != nil {
 		return err
 	}

@@ -160,7 +160,7 @@ func (s *Store) HasOutside(id uint64, k key.Key) (bool, error) {
 	if s.closed {
 		return false, ErrClosed
 	}
-	if _, _, _, ok := s.activeLookupLocked(k); ok {
+	if s.reliableActiveLocked(k) {
 		return true, nil
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
@@ -218,9 +218,14 @@ func (s *Store) Remove(id uint64) error {
 	}
 	defer end()
 	s.appendMu.Lock()
+	// Held until the file is gone: a lookup's listing between the segment
+	// leaving the view and leaving the directory would map it again
+	// (removeVictims has the whole story).
+	s.refreshMu.Lock()
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		s.refreshMu.Unlock()
 		s.appendMu.Unlock()
 		return ErrClosed
 	}
@@ -233,6 +238,7 @@ func (s *Store) Remove(id uint64) error {
 	}
 	if idx < 0 {
 		s.mu.Unlock()
+		s.refreshMu.Unlock()
 		s.appendMu.Unlock()
 		return ErrUnknownSegment
 	}
@@ -244,6 +250,16 @@ func (s *Store) Remove(id uint64) error {
 	ns = append(ns, s.sealed[idx+1:]...)
 	s.sealed = ns
 	s.mu.Unlock()
+	if s.afterDetach != nil {
+		s.afterDetach()
+	}
+	firstErr := os.Remove(seg.path)
+	if s.cfg.sync {
+		if err := s.dirF.Sync(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	s.refreshMu.Unlock()
 	s.appendMu.Unlock()
 
 	// Pre-existing scrubs may still be walking seg's mmap; munmap under one
@@ -251,17 +267,8 @@ func (s *Store) Remove(id uint64) error {
 	// after the unlock above: it can only reach segments still in s.sealed,
 	// never seg (already detached), so the wait still terminates correctly.
 	s.waitScrubs()
-	var firstErr error
-	if err := seg.close(); err != nil {
+	if err := seg.close(); err != nil && firstErr == nil {
 		firstErr = err
-	}
-	if err := os.Remove(seg.path); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	if s.cfg.sync {
-		if err := s.dirF.Sync(); err != nil && firstErr == nil {
-			firstErr = err
-		}
 	}
 	return firstErr
 }

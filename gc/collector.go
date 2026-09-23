@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/amber-store/core/fstree"
@@ -16,8 +17,9 @@ import (
 )
 
 // Collector implements the cycle and the reference hooks over an open
-// packstore and refstore pair. Single-owner, like the stores it sits next
-// to; close it before them.
+// packstore and refstore pair. A process has one per pair; other processes
+// may run their own on the same store (architecture/mark-sweep-gc.md, "Across
+// processes"). Close it before the stores.
 type Collector struct {
 	objects *packstore.Store
 	refs    *refstore.Store
@@ -118,32 +120,26 @@ func (c *Collector) Wipe(reset func() error) error {
 // must be called. Release of an old root needs no bookkeeping; ReleaseRef
 // exists for symmetry.
 func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
-	c.refLock.RLock()
-	// The same span across processes (packstore's gate): a cycle in another
-	// store waits for this PUT, and this PUT waits for one. The barrier that
-	// lets a PUT land during a mark lives in the cycle's own process, so a
-	// PUT from elsewhere must not land between a cycle's roots snapshot and
-	// its sweep at all.
-	endSpan, err := c.objects.BeginWrite()
+	sp, err := c.BeginSpan()
 	if err != nil {
-		c.refLock.RUnlock()
-		return nil, nil, fmt.Errorf("gc: %w", err)
+		return nil, nil, err
 	}
+	if err := c.prepare(root); err != nil {
+		sp.End()
+		return nil, nil, err
+	}
+	return sp.End, sp.End, nil
+}
+
+// prepare is the work of a reference PUT under the reference lock: the
+// completeness walk, and the walked closure handed to the write barrier.
+func (c *Collector) prepare(root key.Key) error {
 	keys, err := fstree.CheckComplete(root, c.objects.Get, c.objects.Has, c.opts.Jobs)
 	if err != nil {
-		endSpan()
-		c.refLock.RUnlock()
-		return nil, nil, fmt.Errorf("gc: walking root %s: %w", root, err)
+		return fmt.Errorf("gc: walking root %s: %w", root, err)
 	}
 	c.objects.ObserveKeys(keys)
-	var once sync.Once
-	release := func() {
-		once.Do(func() {
-			endSpan()
-			c.refLock.RUnlock()
-		})
-	}
-	return release, release, nil
+	return nil
 }
 
 // BeginWrite gates one object-write span (an ingest, a pull, an inbox
@@ -155,22 +151,78 @@ func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
 // removal (packstore.Compact must not overlap ingests). Returns the
 // release, idempotent; call it when the span's writes are durable.
 func (c *Collector) BeginWrite() (done func()) {
-	c.refLock.RLock()
-	// Against a sweep in another process the store's own gate does this job,
-	// and every exported write takes it by itself; opening the span here as
-	// well keeps one span over the caller's whole run of writes. A failure
-	// (the store is closing) is left for those writes to report.
-	endSpan, err := c.objects.BeginWrite()
+	sp, err := c.BeginSpan()
 	if err != nil {
-		endSpan = func() {}
+		// The store is closing, which the span's writes will report. The
+		// reference lock's half of the span is kept all the same.
+		c.refLock.RLock()
+		var once sync.Once
+		return func() { once.Do(c.refLock.RUnlock) }
 	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			endSpan()
-			c.refLock.RUnlock()
-		})
+	return sp.End
+}
+
+// Span is an open write span: object writes and the reference puts that name
+// them, as one unit against the sweep, in this process and in every other. A
+// sweep here or elsewhere waits for it to end, and it waits for one. Inside
+// it references are prepared with Span.PrepareRef, which takes no lock again:
+// Collector.PrepareRef inside a span would take the reference lock a second
+// time, and wait for ever behind a cycle that is waiting for the span.
+//
+// BeginSpan takes the reference lock and then the store's gate, the order a
+// cycle takes them in. A span opened on the store itself
+// (packstore.Store.BeginWrite) and held across Collector.PrepareRef takes
+// them the other way round; in a process that runs cycles the two can wait
+// for each other.
+type Span struct {
+	c     *Collector
+	end   func()
+	once  sync.Once
+	ended atomic.Bool
+}
+
+// BeginSpan opens a write span. End it when its writes are durable and its
+// references are stored.
+func (c *Collector) BeginSpan() (*Span, error) {
+	c.refLock.RLock()
+	// The same span across processes (packstore's gate): a cycle in another
+	// store waits for it, and it waits for one. The barrier that lets a PUT
+	// land during a mark lives in the cycle's own process, so a PUT from
+	// elsewhere must not land between a cycle's roots snapshot and its sweep
+	// at all.
+	end, err := c.objects.BeginWrite()
+	if err != nil {
+		c.refLock.RUnlock()
+		return nil, fmt.Errorf("gc: %w", err)
 	}
+	return &Span{c: c, end: end}, nil
+}
+
+// PrepareRef readies a reference PUT naming root, as Collector.PrepareRef
+// does, under the locks the span already holds. The reference may be stored
+// any time before End; commit and abort are there for the shape and do
+// nothing.
+func (sp *Span) PrepareRef(root key.Key) (commit, abort func(), err error) {
+	if sp.ended.Load() {
+		return nil, nil, fmt.Errorf("gc: PrepareRef on a span that has ended")
+	}
+	if err := sp.c.prepare(root); err != nil {
+		return nil, nil, err
+	}
+	nop := func() {}
+	return nop, nop, nil
+}
+
+// ReleaseRef is Collector.ReleaseRef.
+func (sp *Span) ReleaseRef(root key.Key) error { return sp.c.ReleaseRef(root) }
+
+// End closes the span. It may be called more than once.
+func (sp *Span) End() {
+	sp.once.Do(func() {
+		sp.ended.Store(true)
+		sp.end()
+		sp.c.refLock.RUnlock()
+	})
 }
 
 // ReleaseRef records that one reference naming root was deleted or

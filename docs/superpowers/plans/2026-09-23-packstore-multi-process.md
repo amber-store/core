@@ -360,3 +360,86 @@ Not done, a known lever: adoption runs the recovery a second time although
 the store already holds a view of the segment (open plus first write costs
 about twice an open). Taking over the view's index when the segment is clean
 would halve that; at jj scale it is about a millisecond.
+
+## Review fixes
+
+An independent review of `cad3f25..cc24966` reproduced the defects below, each
+with a throwaway test; the suite, the race run included, had been green over
+all of them. Every fix has a test that was seen failing first.
+
+**Two ways to lose an object, and a deadlock.**
+
+- *The generation could stand still.* A store wrote its remembered value plus
+  one when it let go of the exclusive lock. After another store's sweep that
+  is the value already in the file, so a writer that had seen it did not look
+  again and skipped a write against a reaped segment. Now the counter is read
+  under the exclusive lock and written, one higher, **before** anything is
+  deleted: counting from the file fixes the reviewer's case, writing first
+  covers a sweeper that dies half way, and a store that cannot write it does
+  not sweep (the ignored `WriteAt` error is gone with that). A store that
+  opens in the middle of a sweep cannot tell from any counter, so a store's
+  first write span always refreshes. The sweep's own refresh now happens
+  before its store's spans are let in again.
+  `TestEverySweepMovesTheGeneration`, `TestGenerationMovesBeforeAnythingIsDeleted`,
+  `TestStoreOpenedDuringASweepLooksAgainBeforeItsFirstWrite` (which loses the
+  object with the refresh disabled).
+- *A lookup during Compact or Remove brought victims back.* A listing between
+  the victims leaving the view and leaving the directory mapped them again,
+  and the duplicate check went on finding reaped objects. `refreshMu` is now
+  held from the detach until the files are gone; unmapping, which waits for
+  scrubs, comes after. `TestALookupBetweenDetachAndUnlinkDoesNotBringVictimsBack`
+  (checked against a mutant without the lock), `TestLookupsDuringCompact`.
+- *A write inside an open span deadlocked against a local sweep.* New spans
+  waited for a pending sweep even when the caller already held one, which the
+  sweep was waiting for. A span now joins whatever span is in flight. The
+  price is that a local sweep is no longer shielded from overlapping
+  independent writers; the collector quiesces its writers with the reference
+  lock, and the doc says so. `TestWritesInsideASpanPassAWaitingSweep`
+  (Compact, Wipe, BeginSweep), `TestWritesInsideACollectorSpanPassAWaitingWipe`.
+
+**Should fix.**
+
+- *A lookup's refresh read a view that the store's first write had just
+  closed*, and `Has` returned "file already closed". The refresh treats that
+  as the drop it is. `TestLookupsDuringTheFirstWriteSeeNoError`.
+- *A refresh that failed after a poll lost the polled entries for good.* The
+  poll now moves a copy of the scan; position and entries are committed
+  together under the store's lock. `TestAFailedRefreshLosesNothing`.
+- *`Status` marked from a stale view* and failed on references another process
+  had put. It refreshes first (`Store.Refresh`, new).
+  `TestStatusSeesWhatAnotherStoreWroteAndNamed`.
+- *Durability was acknowledged against another writer's unsynced bytes*, and
+  compaction could delete a synced copy in favour of an unsynced one. A
+  syncing store relies on a foreign record only up to the owner's last
+  `synced` entry (`hasDurably`, `reliableActiveLocked`).
+  `TestDedupDoesNotRelyOnAnotherStoresUnsyncedRecords`,
+  `TestCompactDoesNotLeaveTheOnlyCopyUnsynced`. Reads still report what is
+  visible; the document says so.
+- *Lock order.* `ingest --ref` took the gate and then, through `PrepareRef`,
+  the reference lock; a cycle takes them the other way round. New:
+  `Collector.BeginSpan` and `Span.PrepareRef`; `PrepareRef` and
+  `Collector.BeginWrite` are built on it; the CLI's `ingest --ref` and
+  `commit create --ref` use it (`openSpan`), which also closes the deviation
+  from the spec that `commit create` had no bracket.
+  `TestSpanPutsAReferenceWhileACycleWaits`.
+
+**Minor, taken.** A refresh lists again when something it listed had vanished
+(`TestRefreshListsAgainWhenAListedSegmentVanished`, with a hook that runs a
+whole compaction between listing and opening). A failed directory fsync in
+`createActive` removes the segment before it lets go of its lock. Releasing
+an empty own segment forgets the directory's time, so the next miss lists it
+(no test: it takes two empty idle segments to matter). Stale "single-owner"
+comments, a leftover line in a test. Documentation: rules for implementations
+and known limits in `architecture/packstore.md`, the comparison with git
+corrected, the fast path's two-second caveat, and the open times reconciled
+with `CLAUDE.md` (the spec's 24 / 45 / 197 ms came from the design-time probe,
+a different program; the document now quotes the measured 13 / 52 / 197 ms).
+
+**Left alone, with reasons.** Binding a sidecar to its data file needs a nonce
+in both headers, a format change for a downgrade scenario; listed under known
+limits. No timeout on a stopped lock holder and no bound on a sweeper's wait:
+known limits. `sealIdleLocked` stops at the first segment that turns out
+empty; the next cycle takes the rest. A crashed seal held by a live, poisoned
+store can be picked as a victim; its records are copied, so nothing is lost.
+The sealed footer's layout is older than this branch; the document points at
+the code.
