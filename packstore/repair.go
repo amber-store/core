@@ -60,6 +60,7 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 					s.setFailed(err)
 					return err
 				}
+				s.active.sc.synced(s.active.size)
 			}
 		}
 		return nil

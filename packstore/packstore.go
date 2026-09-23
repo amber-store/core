@@ -66,6 +66,9 @@ type activeSegment struct {
 	f     *os.File
 	size  int64 // accessed only under appendMu
 	index map[key.Key]activeLoc
+	// sc mirrors index on disk (sidecar.go), so that the next open does not
+	// have to scan the data. Nil when it could not be written. Under appendMu.
+	sc *sidecarWriter
 }
 
 // Store is an on-disk content-addressable store over segment files. It is
@@ -188,10 +191,12 @@ func (s *Store) load() error {
 	if err != nil {
 		return err
 	}
-	var activePaths []string
+	var activePaths, sidecarNames []string
 	for _, e := range entries {
 		name := e.Name()
 		switch {
+		case strings.HasSuffix(name, activeSuffix+sidecarSuffix):
+			sidecarNames = append(sidecarNames, name)
 		case strings.HasSuffix(name, activeSuffix):
 			activePaths = append(activePaths, name)
 		case strings.HasSuffix(name, sealedSuffix):
@@ -211,6 +216,14 @@ func (s *Store) load() error {
 		// Anything else (e.g. .DS_Store) is ignored.
 	}
 	slices.SortFunc(s.sealed, func(a, b *sealedSegment) int { return cmp.Compare(a.id, b.id) })
+
+	for _, name := range sidecarNames {
+		if !slices.Contains(activePaths, strings.TrimSuffix(name, sidecarSuffix)) {
+			// The index of a segment that was sealed or wiped: a crash fell
+			// between the segment's rename or removal and the index's.
+			os.Remove(filepath.Join(s.dir, name))
+		}
+	}
 
 	if len(activePaths) > 1 {
 		return fmt.Errorf("%w: %d active segments, want at most one: %v", ErrCorrupt, len(activePaths), activePaths)
@@ -239,7 +252,7 @@ func (s *Store) recoverActive(name string) error {
 		return err
 	}
 	path := filepath.Join(s.dir, name)
-	res, err := scanActive(path)
+	res, err := recoverSegment(path)
 	if err != nil {
 		return err
 	}
@@ -255,6 +268,7 @@ func (s *Store) recoverActive(name string) error {
 		if err := s.dirF.Sync(); err != nil {
 			return err
 		}
+		os.Remove(path + sidecarSuffix) // a sealed segment indexes itself
 		seg, err := openSealed(sealedPath, id)
 		if err != nil {
 			return err
@@ -268,8 +282,9 @@ func (s *Store) recoverActive(name string) error {
 	if err != nil {
 		return err
 	}
-	size := res.size
+	size := res.dataEnd
 	if size < int64(len(magicHeader)) {
+		res.sidecarEnd, res.missing = 0, nil
 		// Header never became durable: reset to a fresh header.
 		// This is deliberate and silent; nothing acknowledged is lost.
 		if err := f.Truncate(0); err != nil {
@@ -287,7 +302,7 @@ func (s *Store) recoverActive(name string) error {
 			return err
 		}
 	}
-	s.active = &activeSegment{id: id, path: path, f: f, size: size, index: res.index}
+	s.active = &activeSegment{id: id, path: path, f: f, size: size, index: res.index, sc: openOwnedSidecar(path, res)}
 	return nil
 }
 
@@ -314,7 +329,8 @@ func (s *Store) createActive() error {
 	if err := s.dirF.Sync(); err != nil {
 		return fail(err)
 	}
-	a := &activeSegment{id: id, path: path, f: f, size: int64(len(magicHeader)), index: make(map[key.Key]activeLoc)}
+	sc, _ := createSidecar(path + sidecarSuffix) // nil on failure: a segment works without one
+	a := &activeSegment{id: id, path: path, f: f, size: int64(len(magicHeader)), index: make(map[key.Key]activeLoc), sc: sc}
 	s.mu.Lock()
 	s.active = a
 	s.mu.Unlock()
@@ -364,12 +380,14 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	a.index[k] = loc
 	s.mu.Unlock()
 	a.size = off + int64(len(rec))
+	a.sc.entry(k, loc) // only now: an entry never precedes its record
 
 	if syncNow && s.cfg.sync {
 		if err := a.f.Sync(); err != nil {
 			s.setFailed(err)
 			return err
 		}
+		a.sc.synced(a.size)
 	}
 	if a.size >= s.cfg.segmentSize {
 		// A mid-seal failure can leave a renamed-but-unpublished segment or
@@ -404,6 +422,7 @@ func (s *Store) syncActive() error {
 		s.setFailed(err)
 		return err
 	}
+	s.active.sc.synced(s.active.size)
 	s.fsyncs.Add(1)
 	return nil
 }
@@ -454,6 +473,10 @@ func (s *Store) sealActiveLocked() error {
 	if err := s.dirF.Sync(); err != nil {
 		return err
 	}
+	// The footer indexes the segment from here on. A crash before the
+	// removal leaves an orphan that the next open deletes.
+	a.sc.close()
+	os.Remove(a.path + sidecarSuffix)
 	seg, err := openSealed(sealedPath, a.id)
 	if err != nil {
 		return err
@@ -746,6 +769,10 @@ func (s *Store) Wipe() error {
 		if err := os.Remove(active.path); err != nil && firstErr == nil {
 			firstErr = err
 		}
+		active.sc.close()
+		if err := os.Remove(active.path + sidecarSuffix); err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
 	}
 	for _, seg := range sealed {
 		if err := seg.close(); err != nil && firstErr == nil {
@@ -776,9 +803,16 @@ func (s *Store) Close() error {
 	s.closed = true
 	var firstErr error
 	if s.active != nil {
-		if err := s.active.f.Sync(); err != nil && firstErr == nil {
-			firstErr = err
+		// Synced whatever the sync option says, so that a store closed
+		// cleanly always reopens from its sidecar alone.
+		if err := s.active.f.Sync(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else {
+			s.active.sc.synced(s.active.size)
 		}
+		s.active.sc.close()
 		if err := s.active.f.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}

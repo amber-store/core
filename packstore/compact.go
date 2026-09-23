@@ -165,6 +165,7 @@ func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats
 			s.setFailed(err)
 			return stats, err
 		}
+		s.active.sc.synced(s.active.size)
 	}
 	return stats, s.removeVictims(victims, &stats)
 }
