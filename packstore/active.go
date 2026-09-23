@@ -280,3 +280,49 @@ func (s *Store) lockForeign(foreign []*foreignActive) ([]*os.File, error) {
 	}
 	return held, nil
 }
+
+// sealIdleLocked seals every active segment that no writer holds. A small
+// store's segments never fill, and the process that wrote them may be long
+// gone: without this nothing in them could ever be collected. A segment a
+// live writer holds is left alone; an active segment is never a victim.
+// Called by Compact under appendMu, after it sealed the store's own segment.
+func (s *Store) sealIdleLocked() error {
+	if a := s.active; a != nil {
+		// Still owned, so empty: sealing left it alone. Let go of it for the
+		// pass; it is on disk for whoever writes next.
+		a.sc.close()
+		a.f.Close()
+		s.mu.Lock()
+		s.structEpoch++
+		s.active = nil
+		s.mu.Unlock()
+	}
+	ls, err := listSegments(s.dir)
+	if err != nil {
+		return err
+	}
+	ids := make([]uint64, 0, len(ls.active))
+	for id := range ls.active {
+		ids = append(ids, id)
+	}
+	slices.SortFunc(ids, func(a, b uint64) int { // the fullest first: the empty ones cannot be sealed
+		return cmp.Or(cmp.Compare(ls.active[b].info.Size(), ls.active[a].info.Size()), cmp.Compare(a, b))
+	})
+	for _, id := range ids {
+		adopted, err := s.adopt(id, ls.active[id].path)
+		if err != nil {
+			return err
+		}
+		if !adopted {
+			continue
+		}
+		if err := s.sealActiveLocked(); err != nil {
+			s.setFailed(err)
+			return err
+		}
+		if s.active != nil {
+			return nil // an empty one: the pass appends its survivors to it
+		}
+	}
+	return nil
+}

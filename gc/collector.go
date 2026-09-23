@@ -119,15 +119,29 @@ func (c *Collector) Wipe(reset func() error) error {
 // exists for symmetry.
 func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
 	c.refLock.RLock()
+	// The same span across processes (packstore's gate): a cycle in another
+	// store waits for this PUT, and this PUT waits for one. The barrier that
+	// lets a PUT land during a mark lives in the cycle's own process, so a
+	// PUT from elsewhere must not land between a cycle's roots snapshot and
+	// its sweep at all.
+	endSpan, err := c.objects.BeginWrite()
+	if err != nil {
+		c.refLock.RUnlock()
+		return nil, nil, fmt.Errorf("gc: %w", err)
+	}
 	keys, err := fstree.CheckComplete(root, c.objects.Get, c.objects.Has, c.opts.Jobs)
 	if err != nil {
+		endSpan()
 		c.refLock.RUnlock()
 		return nil, nil, fmt.Errorf("gc: walking root %s: %w", root, err)
 	}
 	c.objects.ObserveKeys(keys)
 	var once sync.Once
 	release := func() {
-		once.Do(c.refLock.RUnlock)
+		once.Do(func() {
+			endSpan()
+			c.refLock.RUnlock()
+		})
 	}
 	return release, release, nil
 }
@@ -142,8 +156,21 @@ func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
 // release, idempotent; call it when the span's writes are durable.
 func (c *Collector) BeginWrite() (done func()) {
 	c.refLock.RLock()
+	// Against a sweep in another process the store's own gate does this job,
+	// and every exported write takes it by itself; opening the span here as
+	// well keeps one span over the caller's whole run of writes. A failure
+	// (the store is closing) is left for those writes to report.
+	endSpan, err := c.objects.BeginWrite()
+	if err != nil {
+		endSpan = func() {}
+	}
 	var once sync.Once
-	return func() { once.Do(c.refLock.RUnlock) }
+	return func() {
+		once.Do(func() {
+			endSpan()
+			c.refLock.RUnlock()
+		})
+	}
 }
 
 // ReleaseRef records that one reference naming root was deleted or

@@ -168,6 +168,9 @@ func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats
 		s.setFailed(err)
 		return stats, err
 	}
+	if err := s.sealIdleLocked(); err != nil {
+		return stats, err
+	}
 
 	victims, err := s.selectVictims(live, opts, &stats)
 	if err != nil {

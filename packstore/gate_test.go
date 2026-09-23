@@ -250,3 +250,34 @@ func TestCompactWaitsForLocalWriteSpans(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A store that sweeps again and again must not starve a writer in another
+// process, which polls for the lock: between two sweeps the lock is free for
+// microseconds. Without the yield the writer below gets in only by luck.
+func TestBackToBackSweepsYieldToAWaitingWriter(t *testing.T) {
+	a, b := twoStores(t)
+	o := testObjects(t, 1)[0]
+	endFirst := beginSweep(t, a)
+	var putErr error
+	put := async(func() { putErr = b.Put(o.Key, o.Data) })
+	stillWaiting(t, put, "a Put, while another store sweeps,")
+	endFirst()
+
+	sweeps := 0
+	for ; sweeps < 200; sweeps++ {
+		select {
+		case <-put:
+		default:
+			beginSweep(t, a)()
+			continue
+		}
+		break
+	}
+	finishes(t, put, "the Put")
+	if putErr != nil {
+		t.Fatal(putErr)
+	}
+	if sweeps > 20 {
+		t.Fatalf("the writer got in only after %d further sweeps", sweeps)
+	}
+}

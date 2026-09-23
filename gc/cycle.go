@@ -76,14 +76,28 @@ func (c *Collector) cycle(ctx context.Context, garbage float64) (stats CycleStat
 	// Snapshot: barrier on, then the roots, under the reference lock — a
 	// PUT in flight commits or aborts before the snapshot; every later
 	// PUT greys its walked closure, every later ingest its written keys.
+	//
+	// Other processes are held to the simpler safe policy, quiesce: from
+	// here to the end of the cycle the store's gate keeps their writers and
+	// their reference PUTs out (packstore.BeginSweep), and the view taken
+	// now is complete and stable. The gate is taken and dropped under the
+	// reference lock, with no local span in flight, because a file lock
+	// cannot be turned from shared into exclusive atomically.
 	c.refLock.Lock()
-	c.objects.BeginBarrier()
-	roots, err := c.roots()
-	c.refLock.Unlock()
+	endSweep, err := c.objects.BeginSweep(ctx)
 	if err != nil {
-		c.objects.AbortBarrier()
+		c.refLock.Unlock()
 		return stats, err
 	}
+	c.objects.BeginBarrier()
+	roots, err := c.roots()
+	if err != nil {
+		c.objects.AbortBarrier()
+		endSweep()
+		c.refLock.Unlock()
+		return stats, err
+	}
+	c.refLock.Unlock()
 
 	live, err := c.markLive(ctx, roots)
 	c.mu.Lock()
@@ -92,19 +106,22 @@ func (c *Collector) cycle(ctx context.Context, garbage float64) (stats CycleStat
 	if midMark != nil {
 		midMark()
 	}
-	if err != nil {
-		c.objects.AbortBarrier()
-		return stats, err
+	if err == nil {
+		stats.Marked = live.Marked()
+		stats.MarkDuration = time.Since(stats.Start)
 	}
-	stats.Marked = live.Marked()
-	stats.MarkDuration = time.Since(stats.Start)
 
 	// Sweep, excluding reference publication. Compact consumes the grey
 	// set, seals the active segment, rewrites the victims and deletes
-	// them once the copies are durable.
+	// them once the copies are durable. A failed or cancelled mark comes
+	// through here as well: the gate goes under the reference lock.
 	c.refLock.Lock()
 	defer c.refLock.Unlock()
-	if err := ctx.Err(); err != nil {
+	defer endSweep() // before the unlock above
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
 		c.objects.AbortBarrier()
 		return stats, err
 	}

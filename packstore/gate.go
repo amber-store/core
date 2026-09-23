@@ -18,6 +18,16 @@ import (
 // carries the view generation in its first 8 bytes (big-endian).
 const gateFile = "gc.lock"
 
+// Waits for the file lock poll, backing off to maxGatePoll. A store that
+// just swept leaves the lock alone for sweepYield, two polls' worth, before
+// it sweeps again: it would otherwise take the lock back within microseconds
+// of dropping it, and a writer polling from another process could wait as
+// long as the sweeps keep coming.
+const (
+	maxGatePoll = 50 * time.Millisecond
+	sweepYield  = 2 * maxGatePoll
+)
+
 // A GC cycle must not lose an object that a writer just relied on: written,
 // or skipped as a duplicate of a record the cycle is about to reap. Within
 // one process the write barrier and the collector's reference lock see to
@@ -51,12 +61,13 @@ type gate struct {
 
 	mu        sync.Mutex
 	cond      *sync.Cond
-	shared    int    // local write spans in flight
-	flocked   bool   // the file lock is held shared on their behalf
-	exclusive int    // depth: this store holds the file lock exclusively
-	busy      bool   // one goroutine is changing the file lock's state; the others wait
-	blocked   bool   // new local spans wait: a sweep is coming, going, or at work
-	gen       uint64 // the generation this store's view is good for
+	shared    int       // local write spans in flight
+	flocked   bool      // the file lock is held shared on their behalf
+	exclusive int       // depth: this store holds the file lock exclusively
+	busy      bool      // one goroutine is changing the file lock's state; the others wait
+	blocked   bool      // new local spans wait: a sweep is coming, going, or at work
+	gen       uint64    // the generation this store's view is good for
+	sweptAt   time.Time // when this store last dropped the exclusive lock
 	closed    bool
 
 	ignoreGeneration bool // test hook: reproduces the loss the generation prevents
@@ -93,7 +104,7 @@ func (g *gate) generation() (uint64, error) {
 // poll takes the file lock in the given mode, trying without blocking so
 // that the wait ends with ctx or with the store.
 func (g *gate) poll(ctx context.Context, how int) error {
-	for delay := time.Millisecond; ; delay = min(2*delay, 50*time.Millisecond) {
+	for delay := time.Millisecond; ; delay = min(2*delay, maxGatePoll) {
 		switch err := unix.Flock(int(g.f.Fd()), how|unix.LOCK_NB); err {
 		case nil:
 			return nil
@@ -250,8 +261,29 @@ func (g *gate) endExclusive() {
 	binary.BigEndian.PutUint64(b[:], g.gen)
 	g.f.WriteAt(b[:], 0) // not synced: it only has to outlive the processes that are running
 	g.unlock()
-	g.exclusive, g.blocked = 0, false
+	g.exclusive, g.blocked, g.sweptAt = 0, false, time.Now()
 	g.cond.Broadcast()
+}
+
+// yield waits out what is left of sweepYield since this store's last sweep.
+func (g *gate) yield(ctx context.Context) error {
+	g.mu.Lock()
+	wait := time.Until(g.sweptAt.Add(sweepYield))
+	if g.exclusive > 0 {
+		wait = 0 // nested: the lock is held, nobody is being kept waiting for it
+	}
+	g.mu.Unlock()
+	if wait <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(wait):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-g.done:
+		return ErrClosed
+	}
 }
 
 // pauseLocal keeps this store's own write spans out, waiting for the ones in
@@ -311,6 +343,9 @@ func (s *Store) BeginWrite() (done func(), err error) {
 // again before its next write. Compact, Wipe and Remove take the gate
 // themselves; inside a BeginSweep they find it held.
 func (s *Store) BeginSweep(ctx context.Context) (done func(), err error) {
+	if err := s.gate.yield(ctx); err != nil {
+		return nil, err
+	}
 	end, err := s.gate.beginExclusive(ctx)
 	if err != nil {
 		return nil, err
