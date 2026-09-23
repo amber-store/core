@@ -27,7 +27,7 @@ func (s *Store) Missing(keys []key.Key) ([]key.Key, error) {
 	}
 	// Misses are what this call expects, so it looks at the directory once,
 	// up front, rather than after each.
-	if err := s.refreshAfterMiss(false); err != nil {
+	if _, err := s.refreshAfterMiss(false); err != nil {
 		return nil, err
 	}
 	chunkLen := (len(keys) + workers - 1) / workers

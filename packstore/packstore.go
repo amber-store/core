@@ -484,11 +484,14 @@ func lookup[T any](s *Store, k key.Key, find func() (T, error)) (T, error) {
 	v, err := find()
 	stale := errors.Is(err, errStaleView)
 	if stale || errors.Is(err, ErrNotFound) {
-		if rerr := s.refreshAfterMiss(stale); rerr != nil {
+		looked, rerr := s.refreshAfterMiss(stale)
+		if rerr != nil {
 			var zero T
 			return zero, rerr
 		}
-		v, err = find()
+		if looked {
+			v, err = find()
+		}
 	}
 	if errors.Is(err, errStaleView) {
 		var zero T
@@ -583,10 +586,13 @@ func (s *Store) getRecord(k key.Key) ([]byte, error) {
 func (s *Store) StoredSize(k key.Key) (uint64, bool, error) {
 	n, ok, err := s.storedSize(k)
 	if err == nil && !ok {
-		if err := s.refreshAfterMiss(false); err != nil {
-			return 0, false, err
+		looked, rerr := s.refreshAfterMiss(false)
+		if rerr != nil {
+			return 0, false, rerr
 		}
-		n, ok, err = s.storedSize(k)
+		if looked {
+			n, ok, err = s.storedSize(k)
+		}
 	}
 	return n, ok, err
 }
@@ -670,10 +676,13 @@ func (s *Store) SortByLocation(keys []key.Key) {
 func (s *Store) Has(k key.Key) (bool, error) {
 	has, err := s.hasLocal(k)
 	if err == nil && !has {
-		if err := s.refreshAfterMiss(false); err != nil {
-			return false, err
+		looked, rerr := s.refreshAfterMiss(false)
+		if rerr != nil {
+			return false, rerr
 		}
-		has, err = s.hasLocal(k)
+		if looked {
+			has, err = s.hasLocal(k)
+		}
 	}
 	return has, err
 }

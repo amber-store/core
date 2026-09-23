@@ -200,18 +200,20 @@ func (fa *foreignActive) readRecord(k key.Key, loc activeLoc) ([]byte, error) {
 // refreshAfterMiss looks at the directory again after a lookup found nothing
 // (or, with rebuild, found a foreign index out of step with its data).
 // Callers that waited for somebody else's refresh do not repeat it: that
-// listing is newer than their miss.
-func (s *Store) refreshAfterMiss(rebuild bool) error {
+// listing is newer than their miss. looked is false when the view was found
+// current without listing anything, so that the caller need not search it a
+// second time.
+func (s *Store) refreshAfterMiss(rebuild bool) (looked bool, err error) {
 	if !rebuild && s.viewIsCurrent() {
-		return nil
+		return false, nil
 	}
 	seq := s.refreshSeq.Load()
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	if !rebuild && s.refreshSeq.Load() != seq {
-		return nil
+		return true, nil
 	}
-	return s.refreshLocked(rebuild)
+	return true, s.refreshLocked(rebuild)
 }
 
 // viewIsCurrent reports, for the price of a stat or two, that nothing another
