@@ -131,6 +131,18 @@ func (s *Store) Liveness(live func(key.Key) bool) ([]SegmentLiveness, error) {
 // (specs/gc.qnt). A grey set captured since BeginBarrier is consumed and
 // kept alongside live.
 func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats, error) {
+	// Other stores' writers wait for the whole pass and look at the directory
+	// again afterwards (gate.go); inside a collector's BeginSweep the gate is
+	// held already. This store's own writes wait too: a duplicate check must
+	// not race the removal of a segment, and those that bypass the collector
+	// are held by nothing else.
+	end, err := s.gate.beginExclusive(context.Background())
+	if err != nil {
+		return CompactStats{}, err
+	}
+	defer end()
+	s.gate.pauseLocal()
+	defer s.gate.resumeLocal()
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 

@@ -2,6 +2,7 @@ package packstore
 
 import (
 	"cmp"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -123,6 +124,8 @@ type Store struct {
 	refreshMu  sync.Mutex
 	refreshSeq atomic.Uint64
 	refreshes  atomic.Int64
+
+	gate *gate // gc.lock: writers against a sweep, across processes (gate.go)
 }
 
 // beginScrub registers a lock-free mmap walk. Call while holding mu.RLock
@@ -187,6 +190,10 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	}
 	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1, writes: make(map[*writeToken]time.Time)}
 	s.scrubC = sync.NewCond(&s.scrubMu)
+	if s.gate, err = openGate(dir, s.refresh); err != nil {
+		dirF.Close()
+		return nil, err
+	}
 	if ls, err := listSegments(dir); err == nil {
 		removeOrphanSidecars(dir, ls)
 	}
@@ -204,6 +211,7 @@ func (s *Store) releaseDir() {
 	for _, fa := range s.foreign {
 		fa.f.Close()
 	}
+	s.gate.close()
 	s.dirF.Close() // releases the flock
 }
 
@@ -379,7 +387,10 @@ func (s *Store) sealActiveLocked() error {
 // returns an error after appending part of the batch, it best-effort fsyncs
 // that prefix first, so Has-visible records never stay non-durable.
 func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
-	w := s.beginWrite()
+	w, gerr := s.beginWrite()
+	if gerr != nil {
+		return gerr
+	}
 	defer s.endWrite(w)
 	seen := make(map[key.Key]struct{})
 	appended := false
@@ -421,7 +432,10 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 // A dedup hit returns success without fsyncing; if the matching record was
 // appended by a still-running batch, its durability rides on that batch's commit.
 func (s *Store) Put(k key.Key, data []byte) error {
-	w := s.beginWrite()
+	w, gerr := s.beginWrite()
+	if gerr != nil {
+		return gerr
+	}
 	defer s.endWrite(w)
 	s.mu.RLock()
 	failed := s.failed
@@ -689,6 +703,11 @@ func (s *Store) hasLocal(k key.Key) (bool, error) {
 // Readers are drained via the write lock before segments are detached;
 // in-flight Verify walks are waited out before unmapping, exactly like Close.
 func (s *Store) Wipe() error {
+	end, err := s.gate.beginExclusive(context.Background()) // other stores' writers wait, and look again afterwards
+	if err != nil {
+		return err
+	}
+	defer end()
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 	s.refreshMu.Lock() // held throughout: the view must not grow behind the locks taken below
@@ -804,6 +823,9 @@ func (s *Store) Close() error {
 		}
 	}
 	s.sealed = nil
+	if err := s.gate.close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
 	if err := s.dirF.Close(); err != nil && firstErr == nil {
 		firstErr = err
 	}

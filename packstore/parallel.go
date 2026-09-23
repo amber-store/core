@@ -44,7 +44,10 @@ type WriteOpts struct {
 // carry a pre-encoded Record instead of Data; it is validated and appended
 // as is (see Object).
 func (s *Store) WriteParallel(seq iter.Seq2[Object, error], opts WriteOpts) (WriteStats, error) {
-	w := s.beginWrite()
+	w, gerr := s.beginWrite()
+	if gerr != nil {
+		return WriteStats{}, gerr
+	}
 	defer s.endWrite(w)
 	writers := opts.Writers
 	if writers <= 0 {

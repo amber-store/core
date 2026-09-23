@@ -6,6 +6,7 @@
 package packstore
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -23,18 +24,24 @@ var ErrUnknownSegment = errors.New("packstore: no such segment")
 // writeToken marks one in-flight exported write call for the GC horizon.
 type writeToken struct{ _ byte }
 
-func (s *Store) beginWrite() *writeToken {
+// beginWrite opens an exported write: a span of the gate, which keeps other
+// stores' sweeps out, and a token for this store's GC horizon.
+func (s *Store) beginWrite() (*writeToken, error) {
+	if err := s.gate.beginShared(); err != nil {
+		return nil, err
+	}
 	t := new(writeToken)
 	s.writesMu.Lock()
 	s.writes[t] = time.Now()
 	s.writesMu.Unlock()
-	return t
+	return t, nil
 }
 
 func (s *Store) endWrite(t *writeToken) {
 	s.writesMu.Lock()
 	delete(s.writes, t)
 	s.writesMu.Unlock()
+	s.gate.endShared()
 }
 
 // OldestInflightWrite returns the start time of the oldest Put, WriteBatch
@@ -176,6 +183,11 @@ func (s *Store) AppendRecord(k key.Key, raw []byte) error {
 	if raw == nil {
 		return fmt.Errorf("%w: nil record", ErrCorrupt)
 	}
+	w, gerr := s.beginWrite()
+	if gerr != nil {
+		return gerr
+	}
+	defer s.endWrite(w)
 	rec, _, err := prepare(Object{Key: k, Record: raw}, false)
 	if err != nil {
 		return err
@@ -200,6 +212,11 @@ func (s *Store) Sync() error {
 // pinning is the known follow-up before a long-running embedder leans on
 // this.
 func (s *Store) Remove(id uint64) error {
+	end, err := s.gate.beginExclusive(context.Background()) // other stores' writers wait, and look again afterwards
+	if err != nil {
+		return err
+	}
+	defer end()
 	s.appendMu.Lock()
 	s.mu.Lock()
 	if s.closed {

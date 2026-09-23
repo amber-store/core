@@ -18,7 +18,10 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 	if err := verifyObject(Object{Key: k, Data: data}); err != nil {
 		return err
 	}
-	w := s.beginWrite()
+	w, gerr := s.beginWrite()
+	if gerr != nil {
+		return gerr
+	}
 	defer s.endWrite(w)
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
