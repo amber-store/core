@@ -327,6 +327,7 @@ func (fv *footerView) lookupPos(k key.Key) (pos int, ok bool) {
 type sealedSegment struct {
 	id   uint64
 	path string
+	fi   os.FileInfo // which file this is: a repair replaces a segment under its name, and an id can come back
 	mm   []byte
 	fv   *footerView
 }
@@ -355,7 +356,7 @@ func openSealed(path string, id uint64) (*sealedSegment, error) {
 		unix.Munmap(mm)
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &sealedSegment{id: id, path: path, mm: mm, fv: fv}, nil
+	return &sealedSegment{id: id, path: path, fi: st, mm: mm, fv: fv}, nil
 }
 
 func (g *sealedSegment) close() error {

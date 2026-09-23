@@ -52,6 +52,12 @@ func (c *Collector) Status(ctx context.Context) (Status, error) {
 	if err != nil {
 		return Status{}, err
 	}
+	// The references are everybody's; the view of the objects is this
+	// store's, as of its last look. What another process wrote and named
+	// since then is not in it yet, and the mark works from a snapshot of it.
+	if err := c.objects.Refresh(); err != nil {
+		return Status{}, err
+	}
 	live, err := c.markLive(ctx, roots)
 	if err != nil {
 		return Status{}, err

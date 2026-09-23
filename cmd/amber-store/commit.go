@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/amber-store/core/commit"
-	"github.com/amber-store/core/gc"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
 	"github.com/amber-store/core/reference"
@@ -131,6 +130,14 @@ func createCommit(c *cli.Context, objects *packstore.Store, refs *refstore.Store
 	if err != nil {
 		return key.Key{}, err
 	}
+	// One write span from the check that the children are there to the
+	// reference that names the commit: no sweep in another process falls in
+	// between.
+	span, err := openSpan(c, objects, refs, refName != "")
+	if err != nil {
+		return key.Key{}, err
+	}
+	defer span.end()
 	for _, child := range append([]key.Key{rec.Tree}, rec.Parents...) {
 		ok, err := objects.Has(child)
 		if err != nil {
@@ -149,10 +156,7 @@ func createCommit(c *cli.Context, objects *packstore.Store, refs *refstore.Store
 	ref := reference.Reference{Name: refName, Key: k[:], CreatedAt: time.Now().UnixNano()}
 	refRaw, err := ref.Encode()
 	if err == nil {
-		var coll *gc.Collector
-		if coll, err = openCollector(c, objects, refs, gc.Options{}); err == nil {
-			err = errors.Join(putRef(coll, refs, refName, k, refRaw, expectation{}), coll.Close())
-		}
+		err = putRef(span.refs, refs, refName, k, refRaw, expectation{})
 	}
 	if err != nil {
 		return key.Key{}, fmt.Errorf("commit stored (%s) but setting reference %q failed: %w\nretry with: amber-store ref set %q %s",
