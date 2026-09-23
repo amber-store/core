@@ -434,8 +434,11 @@ func TestEncodeAcceptsJJBounds(t *testing.T) {
 		"a term repeats":   func(c *commit.Commit) { c.ConflictTerms[1] = c.ConflictTerms[0] },
 		"terms, no labels": func(c *commit.Commit) { c.ConflictLabels = nil },
 		"max label":        func(c *commit.Commit) { c.ConflictLabels[1] = strings.Repeat("l", commit.MaxLabelLen) },
-		"one-byte id":      func(c *commit.Commit) { c.ChangeID = []byte{0} },
-		"max id":           func(c *commit.Commit) { c.ChangeID = make([]byte, commit.MaxChangeIDLen) },
+		"a long subject": func(c *commit.Commit) {
+			c.ConflictLabels[1] = `wqnwkozp 2768b0b9 "` + strings.Repeat("a paragraph on one line ", 200) + `"`
+		}, // jj labels carry a description's whole first line
+		"one-byte id": func(c *commit.Commit) { c.ChangeID = []byte{0} },
+		"max id":      func(c *commit.Commit) { c.ChangeID = make([]byte, commit.MaxChangeIDLen) },
 	}
 	for name, mutate := range cases {
 		c := conflicted(t)
@@ -465,6 +468,7 @@ func TestEncodeRejectsInvalidJJFields(t *testing.T) {
 		"term is a commit":      func(c *commit.Commit) { c.ConflictTerms[1] = ka },
 		"non-canonical term":    func(c *commit.Commit) { c.ConflictTerms[0][0] |= 0x08 },
 		"labels without terms":  func(c *commit.Commit) { c.ConflictTerms = nil },
+		"one label, no terms":   func(c *commit.Commit) { c.ConflictTerms, c.ConflictLabels = nil, []string{"ours"} }, // the count is right: only the rule against labels on a resolved tree rejects it
 		"a label too few":       func(c *commit.Commit) { c.ConflictLabels = c.ConflictLabels[:2] },
 		"a label too many":      func(c *commit.Commit) { c.ConflictLabels = append(c.ConflictLabels, "x") },
 		"all labels empty":      func(c *commit.Commit) { c.ConflictLabels = []string{"", "", ""} },

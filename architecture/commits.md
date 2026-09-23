@@ -30,7 +30,7 @@ the same convention as `DirLeaf` entries and reference records.
 | 6 | public_key | byte string, omitted when absent | signer's public key, SSH wire format, at most 16 KiB |
 | 7 | change_id | byte string, omitted when absent | 1–64 bytes, opaque: an identity that follows the change when the commit is rewritten |
 | 8 | conflict_terms | array of 32-byte byte strings, omitted when absent | the terms of a conflicted tree after the first ([Conflicts](#conflicts)): an even number, 2–254, each a canonical `DirLeaf` or `DirNode` key; a key may repeat |
-| 9 | conflict_labels | array of text strings, omitted when absent | only with key 8: one label per term counting the tree, so `1 + len(conflict_terms)` of them; each 0–1024 bytes of valid UTF-8 without control characters; at least one non-empty |
+| 9 | conflict_labels | array of text strings, omitted when absent | only with key 8: one label per term counting the tree, so `1 + len(conflict_terms)` of them; each 0–65536 bytes of valid UTF-8 with no code point below U+0020 and no U+007F; at least one non-empty |
 
 Keys 0–4 are always present; 5–9 are omitted when absent, so a commit that
 uses none of them is five entries long. An **identity** is a map whose four
@@ -38,7 +38,7 @@ keys are always present:
 
 | CBOR key | Field | CBOR type | Notes |
 | --- | --- | --- | --- |
-| 0 | name | text string | 0–1024 bytes of valid UTF-8, no control characters (< 0x20 or 0x7F); empty for a user who configured none |
+| 0 | name | text string | 0–1024 bytes of valid UTF-8 with no code point below U+0020 and no U+007F (nothing else counts as a control character here: U+0085 or U+2028 pass); empty for a user who configured none |
 | 1 | email | text string | 0–1024 bytes, same character rules |
 | 2 | when | int64 | ns since the Unix epoch, the store's time convention |
 | 3 | tz_offset | int | minutes east of UTC, −1439..1439 |
@@ -67,10 +67,17 @@ children in the object graph, so they travel and stay alive with the commit.
 | `root_tree: Merge<TreeId>`, values `[A0, R0, A1, …]` | key 0 is `A0`, key 8 the rest |
 | `conflict_labels: Merge<String>` | key 9 |
 | `change_id` | key 7 |
-| `parents`, `description`, `author`, `committer` | keys 1–4; milliseconds map into nanoseconds losslessly |
+| `parents`, `description`, `author`, `committer` | keys 1–4; milliseconds map into nanoseconds losslessly within about 292 years of 1970, and an adapter refuses what lies outside |
 | `secure_sig` | key 5; jj's signing callback signs bytes the backend chooses, and the payload below is such bytes |
 | `predecessors` | not stored: deprecated in jj, which keeps them in its operation log; they would also be the only non-owning edge in the object graph |
 | the virtual root commit | not an object: a commit whose only jj parent is the root has no parents here |
+
+**Labels as jj makes them.** jj builds a label from a commit's short change
+and commit ids and the whole first line of its description, with every
+character that Rust's `char::is_control` names removed, and may add a note
+such as `(rebased revision)`. Such text passes the character rule above,
+which forbids less than jj removes. The first line of a description has no
+bound, hence the generous 64 KiB; an adapter truncates what is longer.
 
 ## Signing
 
@@ -102,7 +109,10 @@ Type 5. The key's length field is a **footprint**, as a directory's is: the
 commit's **own serialized byte length plus the length fields of its tree and
 of every conflict term**. It is the size of the snapshot the commit records,
 plus the commit's own few hundred bytes, and the commit's bytes suffice to
-recompute it, so the store verifies it along with the hash.
+recompute it, so the store verifies it along with the hash. That means
+decoding: bytes under a `Commit` key that do not decode strictly fail
+verification, whatever their length. A sum that does not fit 64 bits is an
+encoding error, and such a commit has no key.
 
 **Parent commits are not counted**, although they are children in the object
 graph:
@@ -118,9 +128,24 @@ graph:
   parents counted, such a directory would report the size of a whole history.
 
 **Changed after v0.0.9.** That release keyed a commit with its own byte length
-alone. Such a key fails verification under this rule, and cannot be named as a
-parent; there is no migration, and those commits are re-created. A commit that
-uses keys 7–9 cannot be decoded by v0.0.9, which rejects unknown keys.
+alone, and such a key no longer matches its object. What that means for a
+store that holds one:
+
+- The graph walks and the directory readers refuse it, with an error that
+  names the footprint rule. So no reference can be put on it or on history
+  built on it, `commit create` refuses it as a parent, and `ls`, `export` and
+  `restore` do not read through it. `commit show` still prints it, which is
+  how its tree is found again.
+- The store's verification refuses it too. **While a reference keeps it
+  alive, every gc pass that has to copy it, and every scrub, fails and reports
+  corrupt pack data**; a release from before this change collects the same
+  store without complaint.
+- There is no migration. Delete the references that reach such commits
+  (`ref rm`), after which gc collects them as garbage, which is not verified,
+  and create the commits again from their trees.
+
+A commit that uses keys 7–9 cannot be decoded by v0.0.9, which rejects unknown
+keys.
 
 ## Reachability
 
@@ -163,6 +188,11 @@ records:
   it for completeness, and transfers it.
 - The directory's own length adds the entry's content-key length, as for any
   entry; by the rule above that is the snapshot's footprint.
+- Nowhere else. Inside a directory's own index the child of a `DirNode` is a
+  `DirNode` or a `DirLeaf`, and the readers refuse a commit there. The codec
+  does not hold an entry's content key to its mode, for commits no more than
+  for files and directories: a commit under an entry that is not `S_IFDIR` is
+  a malformed tree, which path resolution refuses and file operations fail on.
 
 This is where a vendored tree with its history, or jj's
 `TreeValue::GitSubmodule`, has a place. `ingest` never creates such an entry:
@@ -258,7 +288,8 @@ directory, or to a commit, whose tree is then recorded. `--parent` takes a
 commit key or a reference to one, and repeats for a merge, mainline first.
 `--committer` defaults to the author, and `--date` (RFC 3339) to now in the
 local zone; the zone's offset is recorded. `create` refuses a tree or parent
-that is not in the store. `show` prints a conflicted tree's further terms as
+that is not in the store, a parent whose key does not carry its footprint, and
+an empty `--change-id`. `show` prints a conflicted tree's further terms as
 `conflict-remove KEY` and `conflict-add KEY` lines after `tree`, the labels
 that are not empty as `conflict-label N TEXT` (N counts from 0, the tree),
 and `change-id HEX` after the parents. Wherever a command takes a directory

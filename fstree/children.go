@@ -3,7 +3,6 @@ package fstree
 import (
 	"fmt"
 
-	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/key"
 )
 
@@ -62,9 +61,9 @@ func ChildKeys(k key.Key, data []byte) ([]key.Key, error) {
 		}
 		return out, nil
 	case key.Commit:
-		c, err := commit.Decode(data)
+		c, err := decodeCommit(k, data) // and hold k to the key rule: see there
 		if err != nil {
-			return nil, fmt.Errorf("fstree: decoding Commit %s: %w", k, err)
+			return nil, err
 		}
 		trees := c.Trees()
 		out := make([]key.Key, 0, len(trees)+len(c.Parents))

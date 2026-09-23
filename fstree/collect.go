@@ -17,7 +17,9 @@ var ErrNotFound = errors.New("entry not found")
 var ErrNotDir = errors.New("not a directory")
 
 // ResolvePath descends from the directory object root along the slash-separated
-// path and returns the key of the directory it names. Empty components and "."
+// path and returns the content key of the directory entry it names, as stored:
+// a DirLeaf or DirNode key, or the key of a Commit that stands for its tree
+// (DirOf), which every reader here takes. Empty components and "."
 // are ignored, so "", ".", and paths with leading/trailing slashes are
 // accepted; ".." is rejected (a CAS tree has no parent links). A missing
 // component wraps ErrNotFound, a non-directory component wraps ErrNotDir.
@@ -90,6 +92,10 @@ func ResolveEntry(root key.Key, path string, get func(key.Key) ([]byte, error)) 
 // Names must strictly increase across leaves. This also stops a pushed DAG
 // whose DirNodes repeat one child from expanding multiplicatively.
 func CollectEntries(k key.Key, get func(key.Key) ([]byte, error)) ([]Entry, error) {
+	k, err := DirOf(k, get) // a commit stands for its tree: here, and nowhere further down
+	if err != nil {
+		return nil, err
+	}
 	var out []Entry
 	if err := collectEntries(k, get, &out); err != nil {
 		return nil, err
@@ -130,12 +136,6 @@ func collectEntries(k key.Key, get func(key.Key) ([]byte, error), out *[]Entry) 
 			}
 		}
 		return nil
-	case key.Commit: // stands for its tree (dirof.go)
-		tree, err := commitTree(k, data)
-		if err != nil {
-			return err
-		}
-		return collectEntries(tree, get, out)
 	default:
 		return fmt.Errorf("fstree: %s is not a directory object (type %v)", k, k.Type())
 	}

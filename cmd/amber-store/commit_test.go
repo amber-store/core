@@ -100,3 +100,9 @@ func TestRenderCommitConflicted(t *testing.T) {
 		t.Errorf("renderCommit:\n got: %q\nwant: %q", got, want)
 	}
 }
+
+func TestIdentityLineWithoutNameOrEmail(t *testing.T) {
+	if got, want := identityLine(commit.Identity{}), "1970-01-01T00:00:00Z"; got != want {
+		t.Errorf("identityLine = %q, want %q", got, want)
+	}
+}

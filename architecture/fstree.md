@@ -79,7 +79,11 @@ tree is conflicted). Readers pass through it: `LookupEntry`, `ListEntries` and
 continue with its tree, and `DirOf` names the directory a key stands for. A
 commit's tree is never a commit, so one step suffices. The commit is a child of
 the leaf like any content key, so its tree and its history are reachable,
-required for completeness, and kept alive through the directory.
+required for completeness, and kept alive through the directory. A commit
+stands nowhere else: not inside a directory's own index (the child of a
+`DirNode` is a `DirNode` or a `DirLeaf`), and not under an entry of another
+type. The codec does not hold a content key to its entry's mode, so the latter
+is a malformed tree that decodes; path resolution refuses it.
 
 Folding the file type into `mode` (the POSIX way) means there is no separate type
 field; the reader masks `mode & S_IFMT` to learn which payload key is present.

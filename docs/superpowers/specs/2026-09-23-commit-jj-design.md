@@ -67,7 +67,7 @@ none of the new fields encodes exactly as before.
 | 6 | public_key | byte string, optional | unchanged |
 | 7 | change_id | byte string, optional | 1–64 bytes, opaque: an identity that follows the change when the commit is rewritten |
 | 8 | conflict_terms | array of 32-byte byte strings, optional | the terms of a conflicted tree after the first, alternating *remove, add, remove, add, …* (jj's order); an even number, 2–254; each a `DirLeaf` or `DirNode` key; a key may repeat |
-| 9 | conflict_labels | array of text strings, optional | only with key 8, one label per term counting the tree (so `1 + len(conflict_terms)`), each 0–1024 bytes of valid UTF-8 without control characters, at least one of them non-empty; absent when no term is labelled |
+| 9 | conflict_labels | array of text strings, optional | only with key 8, one label per term counting the tree (so `1 + len(conflict_terms)`), each 0–65536 bytes of valid UTF-8 with no code point below U+0020 and no U+007F (raised from 1024 after review: jj puts a description's whole first line into a label), at least one of them non-empty; absent when no term is labelled |
 
 A **conflicted commit** records the tree `A0 − R0 + A1 − R1 + …`: key 0 holds
 `A0` and key 8 holds `R0, A1, R1, A2, …`. Wherever a commit stands for a
@@ -124,7 +124,7 @@ which has none.
 - `commit`: `Commit` gains `ChangeID []byte`, `ConflictTerms []key.Key`,
   `ConflictLabels []string`; `Trees()` (the tree, then the terms) and
   `Conflicted()`; bounds `MaxChangeIDLen = 64`, `MaxConflictTerms = 254`,
-  `MaxLabelLen = 1024`; validation and the wire struct for keys 7–9; an
+  `MaxLabelLen = 65536`; validation and the wire struct for keys 7–9; an
   identity's name may be empty; `Object` computes the footprint length.
 - `fstree`: `ChildKeys` follows `Trees()`; `DirOf`; the three directory
   readers take a commit key.

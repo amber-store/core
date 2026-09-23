@@ -4,7 +4,9 @@
 // streaming. See architecture/types.md for the length-field semantics.
 //
 // The object-graph walks (ChildKeys, ReachableKeys, CheckComplete) also follow
-// Commit objects (package commit), whose children are a tree and parent commits.
+// Commit objects (package commit), whose children are their trees — one, or
+// every side of a conflict — and their parent commits. The directory readers
+// take a commit for the directory it records (dirof.go).
 package fstree
 
 import "github.com/amber-store/core/key"

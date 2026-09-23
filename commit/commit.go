@@ -36,8 +36,10 @@ const (
 	// MaxConflictTerms is the maximum number of conflict terms after the
 	// tree. The number is always even: a remove for every further add.
 	MaxConflictTerms = 254
-	// MaxLabelLen is the maximum byte length of one conflict label.
-	MaxLabelLen = 1024
+	// MaxLabelLen is the maximum byte length of one conflict label. jj makes
+	// a label from a commit's short ids and the whole first line of its
+	// description, which nothing bounds; its adapter truncates beyond this.
+	MaxLabelLen = 64 << 10
 )
 
 // encMode is the shared deterministic encoder, mirroring fstree.encMode.

@@ -10,6 +10,7 @@ import (
 	"github.com/amber-store/core/packstore"
 	"github.com/amber-store/core/reference"
 	"github.com/amber-store/core/refstore"
+	"golang.org/x/sys/unix"
 )
 
 // resolveSpec parses a content spec: either KEY[/PATH] (lowercase-hex key,
@@ -83,6 +84,11 @@ func descend(objects *packstore.Store, root key.Key, path string) (key.Key, erro
 		ck, err := key.Parse(e.ContentKey)
 		if err != nil {
 			return key.Key{}, fmt.Errorf("resolving %q: %q is not a file or directory", path, seg)
+		}
+		// The codec does not hold an entry's content key to its mode. A
+		// commit under anything but a directory entry is a malformed tree.
+		if ck.Type() == key.Commit && e.Mode&unix.S_IFMT != unix.S_IFDIR {
+			return key.Key{}, fmt.Errorf("resolving %q: %q holds a commit but is not a directory entry", path, seg)
 		}
 		k = ck
 	}

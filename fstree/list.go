@@ -19,6 +19,10 @@ func ListEntries(dir key.Key, after []byte, limit int, get func(key.Key) ([]byte
 	if limit <= 0 {
 		return nil, false, fmt.Errorf("fstree: ListEntries limit must be positive, got %d", limit)
 	}
+	dir, err := DirOf(dir, get) // a commit stands for its tree: here, and nowhere further down
+	if err != nil {
+		return nil, false, err
+	}
 	var out []Entry
 	more, err := listInto(&out, dir, after, limit, get)
 	if err != nil {
@@ -73,12 +77,6 @@ func listInto(out *[]Entry, k key.Key, after []byte, limit int, get func(key.Key
 			}
 		}
 		return false, nil
-	case key.Commit: // stands for its tree (dirof.go)
-		tree, err := commitTree(k, data)
-		if err != nil {
-			return false, err
-		}
-		return listInto(out, tree, after, limit, get)
 	default:
 		return false, fmt.Errorf("fstree: %s is not a directory object (type %v)", k, k.Type())
 	}

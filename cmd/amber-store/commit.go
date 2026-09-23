@@ -88,9 +88,12 @@ func runCommitCreate(c *cli.Context) error {
 	author.When, author.TZOffset = when.UnixNano(), offset/60
 	committer.When, committer.TZOffset = when.UnixNano(), offset/60
 	var changeID []byte
-	if s := c.String("change-id"); s != "" {
-		if changeID, err = hex.DecodeString(s); err != nil {
+	if c.IsSet("change-id") {
+		if changeID, err = hex.DecodeString(c.String("change-id")); err != nil {
 			return fmt.Errorf("--change-id: %w", err)
+		}
+		if len(changeID) == 0 {
+			return errors.New("--change-id: empty; leave the flag out for a commit without a change id")
 		}
 	}
 	refName := c.String("ref")
@@ -154,6 +157,18 @@ func createCommit(c *cli.Context, objects *packstore.Store, refs *refstore.Store
 		}
 		if !ok {
 			return key.Key{}, fmt.Errorf("%s is not in the store", child)
+		}
+	}
+	// A parent has to be a commit the graph walks accept. Bytes under a key of
+	// the first release's rule still decode, but no reference could ever be
+	// put on what is built on them.
+	for _, p := range rec.Parents {
+		data, err := objects.Get(p)
+		if err != nil {
+			return key.Key{}, err
+		}
+		if _, err := fstree.ChildKeys(p, data); err != nil {
+			return key.Key{}, fmt.Errorf("parent %s: %w", p, err)
 		}
 	}
 	if err := objects.Put(k, raw); err != nil {
@@ -256,5 +271,9 @@ func identityLine(id commit.Identity) string {
 		who += "<" + id.Email + ">"
 	}
 	zone := time.FixedZone("", id.TZOffset*60)
-	return who + " " + time.Unix(0, id.When).In(zone).Format(time.RFC3339)
+	when := time.Unix(0, id.When).In(zone).Format(time.RFC3339)
+	if who == "" { // an identity may name nobody at all
+		return when
+	}
+	return who + " " + when
 }
