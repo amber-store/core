@@ -1,8 +1,11 @@
 // Package commit defines the Commit object (CAS type 5): the analogue of a git
 // commit — a directory root, ordered parent commits, author, committer and
-// message, with an optional opaque signature. Encoding is RFC 8949 §4.2
-// core-deterministic CBOR (canonical map, integer keys), the fstree and
-// reference convention. See architecture/commits.md.
+// message, with an optional opaque signature — extended with what a jj commit
+// carries besides: a change id, and the further terms and the labels of a
+// conflicted tree. Encoding is RFC 8949 §4.2 core-deterministic CBOR
+// (canonical map, integer keys), the fstree and reference convention. The
+// key's length field is a footprint, like a directory's: the commit's own
+// bytes plus its trees. See architecture/commits.md.
 package commit
 
 import (
@@ -28,6 +31,13 @@ const (
 	MaxPublicKeyLen = 16 << 10
 	// MaxTZOffset bounds Identity.TZOffset to under a day either side of UTC.
 	MaxTZOffset = 1439
+	// MaxChangeIDLen is the maximum ChangeID length in bytes.
+	MaxChangeIDLen = 64
+	// MaxConflictTerms is the maximum number of conflict terms after the
+	// tree. The number is always even: a remove for every further add.
+	MaxConflictTerms = 254
+	// MaxLabelLen is the maximum byte length of one conflict label.
+	MaxLabelLen = 1024
 )
 
 // encMode is the shared deterministic encoder, mirroring fstree.encMode.
@@ -46,7 +56,7 @@ func init() {
 
 // Identity is who acted and when: git's "Name <email> time tz".
 type Identity struct {
-	Name     string // 1..MaxIdentityLen bytes, no control characters
+	Name     string // 0..MaxIdentityLen bytes, no control characters; empty when the user configured none
 	Email    string // 0..MaxIdentityLen bytes, no control characters
 	When     int64  // ns since the Unix epoch
 	TZOffset int    // minutes east of UTC, -MaxTZOffset..MaxTZOffset
@@ -55,6 +65,10 @@ type Identity struct {
 // Commit is a snapshot record. Parents are ordered — the first is the
 // mainline — and empty for a root commit. Signature and PublicKey are carried
 // opaquely; the core neither creates nor verifies signatures.
+//
+// A conflicted commit records the tree A0 − R0 + A1 − R1 + …: Tree holds A0
+// and ConflictTerms holds R0, A1, R1, A2, … (jj's order), so their number is
+// even. Wherever a commit stands for a directory it stands for Tree.
 type Commit struct {
 	Tree      key.Key   // DirLeaf or DirNode
 	Parents   []key.Key // Commit keys, no duplicates
@@ -63,11 +77,24 @@ type Commit struct {
 	Message   string // UTF-8, may be empty
 	Signature []byte // raw SSHSIG blob, nil when unsigned
 	PublicKey []byte // signer's key, SSH wire format, nil when absent
+
+	ChangeID       []byte    // opaque, 1..MaxChangeIDLen bytes: follows the change through rewrites; nil when absent
+	ConflictTerms  []key.Key // DirLeaf or DirNode keys, an even number; nil when the tree is resolved
+	ConflictLabels []string  // one per term counting Tree, at least one non-empty; nil when no term is labelled
 }
+
+// Trees returns every tree the commit records: Tree, then the conflict terms
+// in order. The key's length and the object graph both go by this list.
+func (c Commit) Trees() []key.Key {
+	return append([]key.Key{c.Tree}, c.ConflictTerms...)
+}
+
+// Conflicted reports whether the commit records a conflicted tree.
+func (c Commit) Conflicted() bool { return len(c.ConflictTerms) > 0 }
 
 // wireIdentity and wireCommit are the encoded shapes: canonical CBOR maps with
 // integer keys, fields declared in ascending key order. Every identity key and
-// commit keys 0-4 are always present; 5 and 6 are omitted when absent.
+// commit keys 0-4 are always present; 5-9 are omitted when absent.
 type wireIdentity struct {
 	Name     string `cbor:"0,keyasint"`
 	Email    string `cbor:"1,keyasint"`
@@ -83,6 +110,10 @@ type wireCommit struct {
 	Message   string       `cbor:"4,keyasint"`
 	Signature []byte       `cbor:"5,keyasint,omitempty"`
 	PublicKey []byte       `cbor:"6,keyasint,omitempty"`
+
+	ChangeID       []byte   `cbor:"7,keyasint,omitempty"`
+	ConflictTerms  [][]byte `cbor:"8,keyasint,omitempty"`
+	ConflictLabels []string `cbor:"9,keyasint,omitempty"`
 }
 
 func (id Identity) wire() wireIdentity {
@@ -94,14 +125,24 @@ func (c Commit) wire() wireCommit {
 	for i := range c.Parents {
 		parents[i] = c.Parents[i][:]
 	}
+	var terms [][]byte
+	if len(c.ConflictTerms) > 0 {
+		terms = make([][]byte, len(c.ConflictTerms))
+		for i := range c.ConflictTerms {
+			terms[i] = c.ConflictTerms[i][:]
+		}
+	}
 	return wireCommit{
-		Tree:      c.Tree[:],
-		Parents:   parents,
-		Author:    c.Author.wire(),
-		Committer: c.Committer.wire(),
-		Message:   c.Message,
-		Signature: c.Signature,
-		PublicKey: c.PublicKey,
+		Tree:           c.Tree[:],
+		Parents:        parents,
+		Author:         c.Author.wire(),
+		Committer:      c.Committer.wire(),
+		Message:        c.Message,
+		Signature:      c.Signature,
+		PublicKey:      c.PublicKey,
+		ChangeID:       c.ChangeID,
+		ConflictTerms:  terms,
+		ConflictLabels: c.ConflictLabels,
 	}
 }
 
@@ -134,22 +175,37 @@ func (w wireCommit) commit() (Commit, error) {
 	if err != nil {
 		return Commit{}, fmt.Errorf("committer: %w", err)
 	}
+	// An array or byte string that is present but empty decodes to an empty,
+	// non-nil value, re-encodes to nothing, and so fails Decode's canonical
+	// check: absence has one encoding.
+	var terms []key.Key
+	if len(w.ConflictTerms) > 0 {
+		terms = make([]key.Key, len(w.ConflictTerms))
+	}
+	for i, raw := range w.ConflictTerms {
+		if terms[i], err = key.Parse(raw); err != nil {
+			return Commit{}, fmt.Errorf("conflict term %d: %w", i, err)
+		}
+	}
 	return Commit{
-		Tree:      tree,
-		Parents:   parents,
-		Author:    author,
-		Committer: committer,
-		Message:   w.Message,
-		Signature: w.Signature,
-		PublicKey: w.PublicKey,
+		Tree:           tree,
+		Parents:        parents,
+		Author:         author,
+		Committer:      committer,
+		Message:        w.Message,
+		Signature:      w.Signature,
+		PublicKey:      w.PublicKey,
+		ChangeID:       w.ChangeID,
+		ConflictTerms:  terms,
+		ConflictLabels: w.ConflictLabels,
 	}, nil
 }
 
-// validateText checks an identity string: at most MaxIdentityLen bytes of
-// valid UTF-8 with no control characters.
-func validateText(s string) error {
-	if len(s) > MaxIdentityLen {
-		return fmt.Errorf("exceeds %d bytes", MaxIdentityLen)
+// validateText checks an identity string or a conflict label: at most max
+// bytes of valid UTF-8 with no control characters.
+func validateText(s string, max int) error {
+	if len(s) > max {
+		return fmt.Errorf("exceeds %d bytes", max)
 	}
 	if !utf8.ValidString(s) {
 		return errors.New("must be valid UTF-8")
@@ -163,13 +219,11 @@ func validateText(s string) error {
 }
 
 func (id Identity) validate() error {
-	if id.Name == "" {
-		return errors.New("name must not be empty")
-	}
-	if err := validateText(id.Name); err != nil {
+	// An empty name is what a user who configured none commits under (jj).
+	if err := validateText(id.Name, MaxIdentityLen); err != nil {
 		return fmt.Errorf("name %w", err)
 	}
-	if err := validateText(id.Email); err != nil {
+	if err := validateText(id.Email, MaxIdentityLen); err != nil {
 		return fmt.Errorf("email %w", err)
 	}
 	if id.TZOffset < -MaxTZOffset || id.TZOffset > MaxTZOffset {
@@ -220,6 +274,38 @@ func (c Commit) validate() error {
 	if len(c.PublicKey) > MaxPublicKeyLen {
 		return fmt.Errorf("commit public key exceeds %d bytes", MaxPublicKeyLen)
 	}
+	if len(c.ChangeID) > MaxChangeIDLen {
+		return fmt.Errorf("commit change id exceeds %d bytes", MaxChangeIDLen)
+	}
+	if n := len(c.ConflictTerms); n%2 != 0 || n > MaxConflictTerms {
+		return fmt.Errorf("commit has %d conflict terms, want an even number up to %d: a remove for every further add", n, MaxConflictTerms)
+	}
+	for i, t := range c.ConflictTerms {
+		if err := t.Validate(); err != nil {
+			return fmt.Errorf("commit conflict term %d: %w", i, err)
+		}
+		if typ := t.Type(); typ != key.DirLeaf && typ != key.DirNode {
+			return fmt.Errorf("commit conflict term %d: %s is not a directory key (type %v)", i, t, typ)
+		}
+	}
+	if len(c.ConflictLabels) > 0 {
+		if !c.Conflicted() {
+			return errors.New("commit has conflict labels but no conflict")
+		}
+		if want := 1 + len(c.ConflictTerms); len(c.ConflictLabels) != want {
+			return fmt.Errorf("commit has %d conflict labels for %d terms", len(c.ConflictLabels), want)
+		}
+		labelled := false
+		for i, l := range c.ConflictLabels {
+			if err := validateText(l, MaxLabelLen); err != nil {
+				return fmt.Errorf("commit conflict label %d %w", i, err)
+			}
+			labelled = labelled || l != ""
+		}
+		if !labelled {
+			return errors.New("commit conflict labels are all empty; an unlabelled conflict carries none")
+		}
+	}
 	return nil
 }
 
@@ -231,18 +317,41 @@ func (c Commit) Encode() ([]byte, error) {
 	return encMode.Marshal(c.wire())
 }
 
-// Object encodes c and derives its key: type Commit, length field = the
-// encoding's own byte length.
+// Object encodes c and derives its key: type Commit, the length field a
+// footprint as a directory's is — the encoding's own byte length plus the
+// length of every tree (Trees). Parents are not counted: a parent's length
+// would hold its own parents', so every merge would count the history its
+// parents share twice, roughly doubling the value until it no longer fit;
+// and a directory that holds a commit reports, through this length, the
+// size of what is beneath it, not of its history.
 func (c Commit) Object() (key.Key, []byte, error) {
 	b, err := c.Encode()
 	if err != nil {
 		return key.Key{}, nil, err
 	}
-	k, err := key.New(key.Commit, uint64(len(b)), b)
+	length, err := Footprint(uint64(len(b)), c.Trees())
+	if err != nil {
+		return key.Key{}, nil, err
+	}
+	k, err := key.New(key.Commit, length, b)
 	if err != nil {
 		return key.Key{}, nil, err
 	}
 	return k, b, nil
+}
+
+// Footprint is the length field of the key of a commit whose encoding is own
+// bytes long and which records trees. It is an error for the sum not to fit.
+func Footprint(own uint64, trees []key.Key) (uint64, error) {
+	length := own
+	for _, t := range trees {
+		sum := length + t.Length()
+		if sum < length {
+			return 0, errors.New("commit footprint overflows the key's length field")
+		}
+		length = sum
+	}
+	return length, nil
 }
 
 // SignaturePayload returns the bytes a signature runs over: the deterministic
