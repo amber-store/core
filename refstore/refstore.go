@@ -37,10 +37,14 @@ type Store struct {
 }
 
 // Open opens (creating if missing) the refs database in dir. sync selects
-// the write durability, matching the daemon's --sync flag.
+// the write durability, matching the daemon's --sync flag. A Pebble store
+// left in dir by an earlier release is imported first; see migrate.go.
 func Open(dir string, sync bool) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("refstore: creating %s: %w", dir, err)
+	}
+	if err := migrateLegacy(dir); err != nil {
+		return nil, err
 	}
 	db, err := openDB(filepath.Join(dir, dbFile), sync, true)
 	if err != nil {
