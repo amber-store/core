@@ -222,3 +222,39 @@ with 300 MiB refs against 256 MiB packs, most packs end up nearly all
 live or all dead, so the 0.5-line policy pass already frees 52.5 of the
 51.9 GiB nominal (the store's whole-pipeline picture: policy leaves just
 6.7 GiB of garbage vs 7.0–7.2 GiB at 50 GiB scale on a 3× store).
+
+### Results, 2026-09-23: opening a store, and sharing it (branch `packstore-multi-process`)
+
+Not `amber-bench`: a throwaway program (removed) on the development Mac
+(Apple silicon, APFS), warm cache, random incompressible objects, best of
+three for the opens. "Before" is the branch point (`refstore-sqlite`: one
+exclusive directory lock, every open scans the active segment); "after" adds
+the sidecar index of active segments and lets any number of processes share
+a store (`architecture/packstore.md`).
+
+| | before | after |
+| --- | --- | --- |
+| open, 64 MiB active segment (16k records of 4 KiB) | 13.1 ms | **1.6 ms** |
+| open, 256 MiB (66k records) | 52.4 ms | **6.2 ms** |
+| open, 1 GiB (262k records) | 197.1 ms | **28.9 ms** |
+| open + first put, 64 MiB / 256 MiB / 1 GiB | 11.3 / 43.7 / 178.8 ms | 3.0 / 12.9 / 57.4 ms |
+| open, 512 MiB in 8 / 64 / 516 sealed segments | 2.0 / 2.7 / 9.2 ms | 1.0 / 1.9 / 10.6 ms |
+| `Put` of 2 KiB, sync on | 4.41 ms | 4.79 ms |
+| `Put` of 2 KiB, sync off (20,000) | 5.7 us | 7.6 us |
+| `Has` on an absent key, 8 / 64 / 516 sealed segments | 0.04 / 0.27 / 2.35 us | 2.5 / 2.8 / 5.6 us |
+| `Missing` of 20,000 absent keys, same stores | 3.2 / 3.6 / 8.6 ms | 3.1 / 3.7 / 10.3 ms |
+
+What the numbers say. An open no longer reads the data file: what is left is
+loading the sidecar's entries into a map, about 0.1 us a record, so it still
+grows with the records in active segments. A process-per-command client (jj)
+wants small segments: at 64 MiB an open costs 1.6 ms. With a cold cache the
+gap is wider than shown, since the old open read the whole file. Open plus
+first put costs about twice an open because adoption recovers the segment a
+second time; taking over the index the view already holds is the known lever.
+The gate between writers and a sweep costs about 2 us a write (take `gc.lock`
+shared, read the generation, let go): invisible next to an fsync, where the
+difference above is noise, visible only with sync off. A lookup that finds
+nothing pays a stat of the directory and an fstat per foreign active segment,
+2-3 us, to learn that nothing changed; before that check existed every miss
+listed the directory, 33 / 113 / 760 us at 8 / 64 / 516 segments. The write
+path's duplicate check never pays it, and `Missing` pays it once.

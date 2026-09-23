@@ -34,6 +34,11 @@ func (s *Store) NewMarkSet() *MarkSet {
 			m.active[k] = false
 		}
 	}
+	for _, fa := range s.foreign { // present, and as little a victim as the store's own
+		for k := range fa.scan.index {
+			m.active[k] = false
+		}
+	}
 	return m
 }
 

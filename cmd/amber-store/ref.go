@@ -32,16 +32,65 @@ func refCommand() *cli.Command {
 				Name:      "set",
 				Usage:     "create or overwrite reference NAME pointing at KEY",
 				ArgsUsage: "NAME KEY",
-				Action:    runRefSet,
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "expect", Usage: "only if NAME currently points at `OLD`; 'none': only if NAME does not exist"},
+				},
+				Action: runRefSet,
 			},
 			{
 				Name:      "rm",
 				Usage:     "delete reference NAME",
 				ArgsUsage: "NAME",
-				Action:    runRefRm,
+				Flags: []cli.Flag{
+					&cli.StringFlag{Name: "expect", Usage: "only if NAME currently points at `OLD`"},
+				},
+				Action: runRefRm,
 			},
 		},
 	}
+}
+
+// expectation is the precondition of an optimistic reference write: the
+// reference must not have moved since the caller last looked.
+type expectation struct {
+	conditional bool    // false: write unconditionally
+	absent      bool    // the reference must not exist
+	key         key.Key // otherwise it must point here
+}
+
+func parseExpect(c *cli.Context, allowNone bool) (expectation, error) {
+	if !c.IsSet("expect") {
+		return expectation{}, nil
+	}
+	s := c.String("expect")
+	switch {
+	case s == "":
+		// A script's unset variable. It must not quietly turn the write
+		// into an unconditional one.
+		return expectation{}, errors.New("--expect is empty: it takes the key the reference must point at")
+	case s == "none" && allowNone:
+		return expectation{conditional: true, absent: true}, nil
+	case s == "none":
+		return expectation{}, errors.New("--expect none: a delete cannot expect the reference to be absent")
+	}
+	k, err := parseHexKey(s)
+	if err != nil {
+		return expectation{}, fmt.Errorf("--expect: %w", err)
+	}
+	return expectation{conditional: true, key: k}, nil
+}
+
+// explain turns the store's sentinel errors into what the user expected.
+func (e expectation) explain(name string, err error) error {
+	switch {
+	case errors.Is(err, refstore.ErrConflict) && e.absent:
+		return fmt.Errorf("reference %q already exists: %w", name, err)
+	case errors.Is(err, refstore.ErrConflict):
+		return fmt.Errorf("reference %q does not point at %s: %w", name, e.key, err)
+	case errors.Is(err, refstore.ErrNotFound) && e.conditional:
+		return fmt.Errorf("reference %q does not exist, expected it at %s: %w", name, e.key, err)
+	}
+	return err
 }
 
 func runRefList(c *cli.Context) error {
@@ -103,6 +152,10 @@ func runRefSet(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	exp, err := parseExpect(c, true)
+	if err != nil {
+		return err
+	}
 	rec := reference.Reference{
 		Name:      name,
 		Key:       k[:],
@@ -121,13 +174,17 @@ func runRefSet(c *cli.Context) error {
 		closeStore(objects, refs)
 		return err
 	}
-	err = putRef(coll, refs, name, k, raw)
+	err = putRef(coll, refs, name, k, raw, exp)
 	return errors.Join(err, coll.Close(), closeStore(objects, refs))
 }
 
 func runRefRm(c *cli.Context) error {
 	if c.NArg() != 1 {
 		return fmt.Errorf("ref rm requires exactly one NAME argument, got %d", c.NArg())
+	}
+	exp, err := parseExpect(c, false)
+	if err != nil {
+		return err
 	}
 	objects, refs, err := openStore(c)
 	if err != nil {
@@ -138,7 +195,7 @@ func runRefRm(c *cli.Context) error {
 		closeStore(objects, refs)
 		return err
 	}
-	err = rmRef(coll, refs, c.Args().First())
+	err = rmRef(coll, refs, c.Args().First(), exp)
 	return errors.Join(err, coll.Close(), closeStore(objects, refs))
 }
 
@@ -148,10 +205,20 @@ func runRefRm(c *cli.Context) error {
 // optimistic reference PUT: on a 404 the caller re-sends the missing
 // objects and retries.
 //
-// Calls for one name must be serialized by the caller (the one-shot CLI
-// is); the read-old → prepare → put → release sequence is not atomic
-// against a concurrent writer of the same name.
-func putRef(coll *gc.Collector, refs *refstore.Store, name string, root key.Key, raw []byte) error {
+// Unconditional calls for one name must be serialized by the caller (the
+// one-shot CLI is); the read-old → prepare → put → release sequence is not
+// atomic against a concurrent writer of the same name. With an expectation
+// the store itself refuses the write if the reference moved meanwhile.
+// refGate is what a reference put needs from the collector: the completeness
+// walk under the reference lock. A *gc.Collector opens a span for the one
+// put; a *gc.Span is a span already open around the writes the reference
+// names.
+type refGate interface {
+	PrepareRef(root key.Key) (commit, abort func(), err error)
+	ReleaseRef(root key.Key) error
+}
+
+func putRef(coll refGate, refs *refstore.Store, name string, root key.Key, raw []byte, exp expectation) error {
 	var old *key.Key
 	if prev, err := refs.Get(name); err == nil {
 		prevRef, err := reference.Decode(prev)
@@ -170,11 +237,28 @@ func putRef(coll *gc.Collector, refs *refstore.Store, name string, root key.Key,
 	if err != nil {
 		return err
 	}
-	if err := refs.Put(name, raw); err != nil {
+	var putErr error
+	switch {
+	case !exp.conditional:
+		putErr = refs.Put(name, raw)
+	case exp.absent:
+		putErr = refs.Create(name, raw)
+	default:
+		putErr = refs.CompareAndSwap(name, exp.key, raw)
+	}
+	if putErr != nil {
 		abort()
-		return err
+		return exp.explain(name, putErr)
 	}
 	commit()
+	if exp.conditional {
+		// What was overwritten is what the store compared against, whatever
+		// the read above saw: the expected key, or nothing.
+		old = nil
+		if !exp.absent {
+			old = &exp.key
+		}
+	}
 	if old != nil {
 		return coll.ReleaseRef(*old)
 	}
@@ -183,10 +267,10 @@ func putRef(coll *gc.Collector, refs *refstore.Store, name string, root key.Key,
 
 // rmRef deletes a reference and releases its root: the tails leave the
 // union; the closure file goes if no other name shares the root. No walk.
-func rmRef(coll *gc.Collector, refs *refstore.Store, name string) error {
+func rmRef(coll *gc.Collector, refs *refstore.Store, name string, exp expectation) error {
 	prev, err := refs.Get(name)
 	if err != nil {
-		return err
+		return exp.explain(name, err)
 	}
 	ref, err := reference.Decode(prev)
 	if err != nil {
@@ -196,8 +280,14 @@ func rmRef(coll *gc.Collector, refs *refstore.Store, name string) error {
 	if err != nil {
 		return fmt.Errorf("reference %q: %w", name, err)
 	}
-	if err := refs.Delete(name); err != nil {
-		return err
+	if exp.conditional {
+		// What was deleted pointed at the expected key, whatever prev said.
+		err, root = refs.CompareAndDelete(name, exp.key), exp.key
+	} else {
+		err = refs.Delete(name)
+	}
+	if err != nil {
+		return exp.explain(name, err)
 	}
 	return coll.ReleaseRef(root)
 }

@@ -18,7 +18,10 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 	if err := verifyObject(Object{Key: k, Data: data}); err != nil {
 		return err
 	}
-	w := s.beginWrite()
+	w, gerr := s.beginWrite()
+	if gerr != nil {
+		return gerr
+	}
 	defer s.endWrite(w)
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
@@ -44,7 +47,14 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 			damaged = !validRepairRecord(k, raw)
 		}
 	}
-	for _, seg := range s.sealed {
+	// The view can change under a refresh, which takes no appendMu: walk a
+	// snapshot, registered as a scrub so that nothing in it is unmapped.
+	s.mu.RLock()
+	s.beginScrub()
+	sealed := slices.Clone(s.sealed)
+	s.mu.RUnlock()
+	defer s.endScrub()
+	for _, seg := range sealed {
 		if off, slen, ok := seg.fv.lookup(k); ok {
 			found = true
 			raw, err := repairRecord(seg, indexEntry{k: k, off: off, slen: slen})
@@ -60,6 +70,7 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 					s.setFailed(err)
 					return err
 				}
+				s.active.sc.synced(s.active.size)
 			}
 		}
 		return nil
@@ -77,14 +88,17 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 		s.setFailed(err)
 		return err
 	}
-	for i, seg := range s.sealed {
+	s.mu.RLock()
+	sealed = slices.Clone(s.sealed) // again: it now holds what was the active segment
+	s.mu.RUnlock()
+	for _, seg := range sealed {
 		damaged := false
 		if off, slen, ok := seg.fv.lookup(k); ok {
 			raw, err := repairRecord(seg, indexEntry{k: k, off: off, slen: slen})
 			damaged = err != nil || !validRepairRecord(k, raw)
 		}
 		if damaged {
-			if err := s.repairSegment(i, seg, k, replacement); err != nil {
+			if err := s.repairSegment(seg, k, replacement); err != nil {
 				return err
 			}
 		}
@@ -107,7 +121,7 @@ func repairRecord(seg *sealedSegment, e indexEntry) ([]byte, error) {
 }
 
 // repairSegment runs under appendMu. Replacement never changes an old mmap.
-func (s *Store) repairSegment(position int, seg *sealedSegment, k key.Key, replacement []byte) error {
+func (s *Store) repairSegment(seg *sealedSegment, k key.Key, replacement []byte) error {
 	entries := slices.Collect(seg.fv.allEntries())
 	slices.SortFunc(entries, func(a, b indexEntry) int { return cmp.Compare(a.off, b.off) })
 	temporary := seg.path + ".repair"
@@ -163,17 +177,12 @@ func (s *Store) repairSegment(position int, seg *sealedSegment, k key.Key, repla
 		return err
 	}
 	ready.path = seg.path
+	// The replacement takes seg's place by id. Readers holding mu have
+	// drained; registered mmap walks — this one included — can still use seg,
+	// which is unmapped when the last of them ends. Never wait under
+	// appendMu: a ScanIndex callback may itself write.
 	s.mu.Lock()
-	s.sealed[position] = ready
-	// Readers holding mu have drained. Registered mmap walks can still use seg.
-	// Never wait under appendMu: a ScanIndex callback may itself write.
-	s.scrubMu.Lock()
-	if s.scrubN == 0 {
-		err = seg.close()
-	} else {
-		s.retired = append(s.retired, seg)
-	}
-	s.scrubMu.Unlock()
+	s.publishSealedLocked(ready)
 	s.mu.Unlock()
-	return err
+	return nil
 }

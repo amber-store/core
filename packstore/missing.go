@@ -25,6 +25,11 @@ func (s *Store) Missing(keys []key.Key) ([]key.Key, error) {
 	if workers == 0 {
 		return nil, nil
 	}
+	// Misses are what this call expects, so it looks at the directory once,
+	// up front, rather than after each.
+	if _, err := s.refreshAfterMiss(false); err != nil {
+		return nil, err
+	}
 	chunkLen := (len(keys) + workers - 1) / workers
 	results := make([][]key.Key, workers)
 
@@ -39,7 +44,7 @@ func (s *Store) Missing(keys []key.Key) ([]key.Key, error) {
 		eg.Go(func() error {
 			var miss []key.Key
 			for _, k := range chunk {
-				has, err := s.Has(k)
+				has, err := s.hasLocal(k)
 				if err != nil {
 					return fmt.Errorf("missing-check %s: %w", k, err)
 				}

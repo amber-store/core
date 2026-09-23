@@ -1,10 +1,15 @@
 // Package packstore persists Amber-Store CAS objects in log-structured,
-// append-only segment (pack) files. The store directory contains only segment
-// files: sealed segments are immutable, mmap'd whole, and self-indexed by a
-// footer (fanout index on the last key byte + binary fuse filter + fixed
-// trailer); the single active segment is recovered by a tail-scan. There is no
-// global index. All format integers are big-endian. Record framing lives in the
-// amberpack package. See docs/superpowers/specs/2026-06-13-packstore-design.md.
+// append-only segment (pack) files. Sealed segments are immutable, mmap'd
+// whole, and self-indexed by a footer (fanout index on the last key byte +
+// binary fuse filter + fixed trailer). An active segment is indexed in its
+// owner's memory and, for everybody else and for the next open, by a sidecar
+// file beside it (sidecar.go). There is no global index. A directory may be
+// open in any number of stores, in any number of processes: a writer owns an
+// active segment of its own (active.go), readers lock nothing and look at
+// the directory again when they miss (view.go), and one lock file keeps
+// writers and a GC sweep apart (gate.go). All format integers are big-endian.
+// Record framing lives in the amberpack package. See
+// architecture/packstore.md.
 package packstore
 
 import (

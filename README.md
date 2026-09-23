@@ -64,7 +64,11 @@ store:
 The packages compose loosely; consumers wire them together and own their
 store-directory layout. The conventional layout (which the CLI uses) is
 `<dir>/packstore` for objects and `<dir>/refs` for references. A store
-directory is **single-owner**: never open one from two live processes.
+directory may be open in **any number of processes at once**: readers take no
+lock, each writer owns an active segment of its own, and a GC cycle keeps the
+writers of other processes waiting while it runs
+([architecture/packstore.md](architecture/packstore.md)). They must all run on
+one host, on a local filesystem.
 
 | Package | Role |
 |---------|------|
@@ -74,8 +78,8 @@ directory is **single-owner**: never open one from two live processes.
 | `chunkers` | Content-defined byte chunking (ultracdc) and item chunking for tree nodes. |
 | `ingest` | Build a tree from a local directory (or single file): `Objects` streams every built object plus the resolved root; `Dir` writes straight into a packstore; `Scan` sizes progress displays. Honors `.amberignore`; `Opts.Exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
-| `packstore` | The local object store: append-only pack segments with parallel, deduplicating, verifying writers. |
-| `refstore` | Pebble-backed name → record map for references. |
+| `packstore` | The local object store: append-only pack segments with parallel, deduplicating, verifying writers, shared by any number of processes. |
+| `refstore` | SQLite-backed (WAL, multi-process) name → record map for references, with optimistic updates. |
 | `reference` | The reference record: canonical CBOR encoding and validation; signature fields carried opaquely. |
 | `amberpack` | The flat pack stream format (`key + payload` records, no root) used for transfer and storage. |
 | `inbox` | Durable pack receiving: persist incoming packs, then drain them into a packstore. |
@@ -115,6 +119,7 @@ amber-store --store ./store export ref:backups/home -o tree.tar  # PAX tar (defa
 amber-store --store ./store restore ref:backups/home ./dest      # recreate the tree on disk
 amber-store --store ./store ref list                    # references: name, key, created, user
 amber-store --store ./store ref set NAME KEY            # name an existing key
+amber-store --store ./store ref set --expect OLD NAME KEY  # move NAME only if it still points at OLD ('none': only create)
 amber-store --store ./store ref get NAME                # print the key a name points at
 amber-store --store ./store ref rm NAME                 # delete the name; objects stay
 amber-store --store ./store commit create --ref main --author 'Ann <ann@example.com>' -m 'first' KEY  # record a tree; --parent KEY|ref:NAME links history; --change-id HEX carries a change id
@@ -146,6 +151,7 @@ root. `--no-ignore` disables all ignore processing.
 | [`architecture/types.md`](architecture/types.md) | The type model: object types, filesystem entry types, length-field semantics. |
 | [`architecture/fstree.md`](architecture/fstree.md) | On-the-wire CBOR layout of every type, the chunkers, tree construction, and read paths. |
 | [`architecture/amberpack.md`](architecture/amberpack.md) | The flat pack stream: record framing, CRCs, recovery. |
+| [`architecture/packstore.md`](architecture/packstore.md) | The store directory, the sidecar index of active segments, and the rules for sharing a store between processes. |
 | [`architecture/references.md`](architecture/references.md) | Named pointers to keys: record layout, name rules, storage. |
 | [`architecture/commits.md`](architecture/commits.md) | The commit object: record layout, conflicts and the change id, the footprint length, signing convention, reachability, commits inside directories, golden vectors. |
 

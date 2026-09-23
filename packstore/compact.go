@@ -114,6 +114,13 @@ func (s *Store) Liveness(live func(key.Key) bool) ([]SegmentLiveness, error) {
 		}
 		report = append(report, info)
 	}
+	for _, fa := range s.foreign { // other writers' active segments: never victims either
+		info := SegmentLiveness{ID: fa.id}
+		for k, loc := range fa.scan.index {
+			info.add(live(k), loc.slen)
+		}
+		report = append(report, info)
+	}
 	return report, nil
 }
 
@@ -124,6 +131,18 @@ func (s *Store) Liveness(live func(key.Key) bool) ([]SegmentLiveness, error) {
 // (specs/gc.qnt). A grey set captured since BeginBarrier is consumed and
 // kept alongside live.
 func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats, error) {
+	// Other stores' writers wait for the whole pass and look at the directory
+	// again afterwards (gate.go); inside a collector's BeginSweep the gate is
+	// held already. This store's own writes wait too: a duplicate check must
+	// not race the removal of a segment, and those that bypass the collector
+	// are held by nothing else.
+	end, err := s.gate.beginExclusive(context.Background())
+	if err != nil {
+		return CompactStats{}, err
+	}
+	defer end()
+	s.gate.pauseLocal()
+	defer s.gate.resumeLocal()
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
 
@@ -149,6 +168,9 @@ func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats
 		s.setFailed(err)
 		return stats, err
 	}
+	if err := s.sealIdleLocked(); err != nil {
+		return stats, err
+	}
 
 	victims, err := s.selectVictims(live, opts, &stats)
 	if err != nil {
@@ -165,6 +187,7 @@ func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats
 			s.setFailed(err)
 			return stats, err
 		}
+		s.active.sc.synced(s.active.size)
 	}
 	return stats, s.removeVictims(victims, &stats)
 }
@@ -208,10 +231,8 @@ func (s *Store) copyLive(victims []*sealedSegment, live func(key.Key) bool, pace
 	survivorHas := func(k key.Key) bool {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		if s.active != nil {
-			if _, ok := s.active.index[k]; ok {
-				return true
-			}
+		if s.reliableActiveLocked(k) { // not a copy a live writer has yet to sync: the victim's may be the durable one
+			return true
 		}
 		for _, g := range s.sealed {
 			if !victimID[g.id] && g.has(k) {
@@ -292,6 +313,13 @@ func (s *Store) removeVictims(victims []*sealedSegment, stats *CompactStats) err
 	for _, g := range victims {
 		victimID[g.id] = true
 	}
+	// A lookup that finds nothing lists the directory (view.go). Between the
+	// victims leaving the view and leaving the directory, such a listing
+	// would map them again, and the duplicate check would go on finding what
+	// is gone. No listing runs in between: refreshMu is held. Unlinking does
+	// not have to wait for scrubs, only unmapping does — and must not wait
+	// here: a scrub's callback may be waiting for refreshMu.
+	s.refreshMu.Lock()
 	s.mu.Lock()
 	// Fresh slice: never mutate an array a concurrent reader may still
 	// hold (same discipline as Remove).
@@ -303,24 +331,30 @@ func (s *Store) removeVictims(victims []*sealedSegment, stats *CompactStats) err
 	}
 	s.sealed = kept
 	s.mu.Unlock()
-	s.waitScrubs() // in-flight scrub walks may still read the victims' mmaps
-
+	if s.afterDetach != nil {
+		s.afterDetach()
+	}
 	var firstErr error
 	for _, g := range victims {
-		stats.BytesFreed += uint64(len(g.mm))
-		if err := g.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
 		if err := os.Remove(g.path); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
-	stats.SegmentsCompacted = len(victims)
 	if s.cfg.sync {
 		if err := s.dirF.Sync(); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
+	s.refreshMu.Unlock()
+
+	s.waitScrubs() // in-flight scrub walks may still read the victims' mmaps
+	for _, g := range victims {
+		stats.BytesFreed += uint64(len(g.mm))
+		if err := g.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	stats.SegmentsCompacted = len(victims)
 	return firstErr
 }
 
