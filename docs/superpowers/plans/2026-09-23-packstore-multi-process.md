@@ -1,0 +1,258 @@
+# Packstore Multi-Process Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Give active segments a sidecar index so that opening a store no longer scans them, and let any number of processes read and write one packstore at once, with GC staying safe.
+
+**Architecture:** Every active segment gets an append-only sidecar (`<id>.seg.active.idx`) of fixed-size, CRC'd records: one entry per data record and a `synced` marker per data fsync. Opening trusts entries up to the last marker, verifies the rest against the data, and tail-scans what the index does not cover. The exclusive directory lock goes away: a writer owns an active segment through an `flock` on its data file and adopts an unlocked one before creating another; readers lock nothing and refresh their view of the directory on a miss. One lock file, `gc.lock`, carries the cross-process form of the collector's reference lock — shared for write spans and reference publication, exclusive for a whole GC cycle — and a generation counter that makes stale views refresh before a duplicate check.
+
+**Tech Stack:** Go 1.26, `golang.org/x/sys/unix` (`flock`), no new dependencies.
+
+**Spec:** `docs/superpowers/specs/2026-09-23-packstore-multi-process-design.md`
+
+**On the form of this plan.** The executor is the author of the design and works test-first, so tasks give exact files, signatures, the tests with what each pins, and the algorithms; code is written against the existing 800-line `packstore.go` during execution rather than copied from here. Anything execution changes is recorded under "Amendments during execution".
+
+## Global Constraints
+
+- Sealed segment format unchanged. A store written by an earlier release opens as is.
+- Sidecar: `<id>.seg.active.idx`; magic `AMBERIX\x01`; 56-byte big-endian records `kind(1) key(32) off(8) flags(1) ulen(4) slen(4) zero(2) crc32c(4)`; kinds `0x01` entry, `0x02` synced; CRC-32C (Castagnoli) over bytes `[0:52]`. Never fsynced.
+- Owner writes data before its entry; appends `synced{dataLen}` only after a data fsync returned.
+- Readers never lock, never modify a file. Only the holder of a segment's `flock` truncates, seals, or rewrites its sidecar.
+- A store holds a **shared** `flock` on the directory for its life (keeps pre-change binaries, which take it exclusively, out).
+- Segment ids: one namespace, highest-plus-one, claimed with `O_EXCL`, retry on collision.
+- Adoption before creation; largest unlocked active segment first. `Close` does not seal.
+- Public lookups (`Get`, `GetRecord`, `Has`, `StoredSize`, `Missing`, `SortByLocation`) refresh the view on a miss — `Missing` and `SortByLocation` at most once per call. The write path's duplicate check never refreshes.
+- `gc.lock`: shared = any exported write and the collector's `BeginWrite`/`PrepareRef`; exclusive = a whole GC cycle, and `Wipe`. The file's first 8 bytes are a big-endian generation counter, incremented by the exclusive holder before it lets go; a store that takes the shared lock and sees a new generation refreshes first.
+- `flock` is never converted between modes: exclusive is taken and dropped only with no local span in flight.
+- Lock waits poll with `LOCK_NB` (1 ms doubling to 50 ms) so they honour a context or a closing store.
+- Branch `packstore-multi-process`, stacked on `refstore-sqlite`. Commit per task; do not push until the final review is done.
+- Verification commands must preserve exit status (`set -o pipefail`; never `go test | tail` bare).
+- Commit message style is `pkg: summary`. End every commit message with:
+
+  ```
+  Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+  Claude-Session: https://claude.ai/code/session_019kMb3Ckqnion4SKma81cfN
+  ```
+
+## Review Focus
+
+1. **A writer killed between the data fsync and the index append** (`Put` acknowledged, entry missing): every later open, by any process, must still find the record. Task 2, `TestAcknowledgedRecordMissingFromIndexIsFound`.
+2. **An index entry that outlived its data** (power loss with sync off, or a torn data tail): it must never resolve to bytes of a *later* record after the owner truncates and appends again. Task 2, `TestStaleEntriesNeverPointIntoNewRecords`.
+3. **A reader open for a long time** (pager) while segments are sealed, compacted away and replaced: reads keep working from old mappings, a miss finds the new home, and the reader never blocks adoption. Task 3, `TestLongLivedReaderSurvivesSealAndCompaction`.
+4. **A stale writer's duplicate hit against a reaped segment** after another process's cycle: must refresh first. Task 4, `TestStaleWriterRefreshesBeforeDedup`, reproduced failing with the generation check disabled.
+5. **Pre-change binaries on a live store**: the old exclusive directory lock must fail while a new store is open, and a new open must fail while the old lock is held. Task 3, `TestOldExclusiveDirectoryLockIsRefused`.
+
+## File Structure
+
+| File | Responsibility |
+| --- | --- |
+| `packstore/sidecar.go` (new) | record encode/decode, `sidecarWriter`, `readSidecar` |
+| `packstore/recover.go` | `recoverActive(data, idx, owner)` by the reading rules; `scanActive` becomes the tail scanner with a start offset |
+| `packstore/active.go` (new) | `ownedSegment` lifecycle: adopt, create (id allocation), seal hook, release; `foreignActive` views |
+| `packstore/view.go` (new) | `listSegments`, building and refreshing the view, retiring vanished mappings |
+| `packstore/gate.go` (new) | `gate`: shared/exclusive `flock` per store with local counting, generation counter |
+| `packstore/packstore.go`, `gc.go`, `compact.go`, `markset.go`, `missing.go`, `repair.go` | integration |
+| `gc/collector.go`, `gc/cycle.go` | cycle under the exclusive gate; spans under the shared one |
+| `architecture/packstore.md` (new), `architecture/mark-sweep-gc.md`, `README.md`, `CLAUDE.md`, `specs/gc.qnt` (comment only) | docs |
+
+---
+
+### Task 1: the sidecar format
+
+**Files:** create `packstore/sidecar.go`, `packstore/sidecar_test.go`.
+
+**Interfaces (produces):**
+
+```go
+const sidecarSuffix = ".idx"            // appended to the active file's name
+const sidecarRecSize = 56
+var sidecarMagic = []byte("AMBERIX\x01")
+
+type sidecarRec struct {                 // kind entry: all fields; kind synced: off = durable data length
+	kind  byte
+	k     key.Key
+	off   uint64
+	flags byte
+	ulen  uint32
+	slen  uint32
+}
+func (r sidecarRec) encode() [sidecarRecSize]byte
+func decodeSidecarRec(b []byte) (sidecarRec, bool)      // false: bad CRC, bad kind, nonzero reserved
+
+// readSidecar parses b (a whole sidecar file, or the part from a record
+// boundary with atStart=false). It returns the records up to the first
+// invalid or partial one and the number of bytes they cover.
+func readSidecar(b []byte, atStart bool) (recs []sidecarRec, valid int)
+
+type sidecarWriter struct{ f *os.File; off int64; broken bool }
+func createSidecar(path string) (*sidecarWriter, error)             // truncates, writes the magic
+func openSidecarAt(path string, valid int64) (*sidecarWriter, error) // truncates to valid, appends after
+func (w *sidecarWriter) entry(k key.Key, loc activeLoc) // failures set broken and are not returned
+func (w *sidecarWriter) synced(dataLen int64)
+func (w *sidecarWriter) close() error
+```
+
+A failed sidecar write must not fail the store write: the data is intact and recovery copes with a short index. After the first failure the writer stops writing (`broken`), so a later record can never follow a hole.
+
+**Tests (`sidecar_test.go`):**
+- `TestSidecarRecordRoundTrip`: entry and synced survive encode/decode; every single-bit flip in a record makes `decodeSidecarRec` report false.
+- `TestReadSidecarStopsAtFirstBadRecord`: truncation at every byte of a three-record file yields the whole records before the cut and the right `valid`; a corrupted middle record hides everything after it.
+- `TestReadSidecarRejectsBadMagic`.
+- `TestSidecarWriterStopsAfterAFailure`: closing the file under the writer makes the next `entry` a no-op and `broken` true, without panicking.
+
+- [ ] Write the tests, watch them fail, implement, pass, `go vet ./packstore`, commit `packstore: the sidecar index format for active segments`.
+
+---
+
+### Task 2: recover an active segment from its sidecar
+
+**Files:** modify `packstore/recover.go`, `packstore/packstore.go` (append, sync, seal, close, wipe, open); create `packstore/recover_sidecar_test.go`; adjust `packstore/recover_test.go` call sites.
+
+**Interfaces:**
+
+```go
+// scanActiveFrom is today's scanActive starting at off (the magic is checked by the caller when off == 0).
+func scanActiveFrom(b []byte, off int64, index map[key.Key]activeLoc) (end int64, sealed bool)
+
+type recovered struct {
+	index      map[key.Key]activeLoc
+	dataEnd    int64 // end of valid data
+	sidecarEnd int64 // bytes of the sidecar that agree with dataEnd (0: rewrite it)
+	missing    []sidecarRec // records found by verification or tail scan that the sidecar lacks
+	sealed     bool  // the data file carries a complete footer
+}
+// recoverActive applies the spec's reading rules. It never writes.
+func recoverActive(dataPath, sidecarPath string) (recovered, error)
+```
+
+Reading the data: trusted entries need no data bytes; verification and the tail scan read only from the first untrusted byte on (`ReadAt` into a buffer, not `os.ReadFile` of the whole file). The footer check for a crashed seal reads the fixed-size trailer first and the footer only if the trailer is valid.
+
+The owner (single active segment still, in this task) on open: `recoverActive`, truncate the data to `dataEnd`, `openSidecarAt(sidecarEnd)` (or `createSidecar` plus all entries when `sidecarEnd == 0`), append `missing`. `appendLocked` adds `entry` after the data write; every successful data fsync (`append` with `syncNow`, `syncActive`, `Close`, `PutVerified`) adds `synced{a.size}`. `sealActiveLocked` closes and removes the sidecar after the rename's directory fsync. `Wipe` removes it. Open removes a sidecar whose data file is gone.
+
+**Tests:**
+- `TestOpenTrustsSyncedEntries`: write with sync on, close, flip a payload byte of an early record, reopen: open succeeds and `Has` is still true for every key (today's scan would truncate there; `Verify`/scrub is where corruption is reported). Pins "trusted entries are not re-read".
+- `TestOpenReadsOnlyTheUntrustedTail`: with a counting `ReadAt` seam or by file size arithmetic: after a clean close, recovery reads zero data bytes beyond the trailer probe.
+- `TestAcknowledgedRecordMissingFromIndexIsFound` (Review Focus 1): truncate the sidecar by one entry and one marker after a synced `Put`; reopen; the record is found and the sidecar is whole again.
+- `TestUnsyncedEntriesAreVerified`: sync off, no clean close (copy the files mid-run), corrupt the last record's payload: reopen drops exactly that record, keeps the earlier ones, truncates the data.
+- `TestStaleEntriesNeverPointIntoNewRecords` (Review Focus 2): after the previous scenario, append new records and reopen twice; every key resolves to its own bytes.
+- `TestMissingSidecarFallsBackToFullScan`, `TestGarbageSidecarFallsBackToFullScan`.
+- `TestSealRemovesSidecar`, `TestOrphanSidecarIsRemoved`, `TestWipeRemovesSidecar`.
+- `TestCrashBetweenFooterAndRename` (existing) still passes with a sidecar present.
+- All existing `recover_test.go` cases pass against `scanActiveFrom`.
+
+- [ ] Tests first, implement, `go test ./packstore`, `go test -race ./packstore`, vet, commit `packstore: open active segments from their sidecar index`.
+- [ ] Re-run the throwaway open-cost measurement (64 MiB, 256 MiB, 1 GiB of 4 KiB objects, warm cache, best of 3; outside the repo, removed afterwards) and keep the numbers for Task 6.
+
+---
+
+### Task 3: many active segments, ownership, and views that refresh
+
+**Files:** create `packstore/active.go`, `packstore/view.go`, `packstore/multi_test.go`, `packstore/process_test.go`; modify `packstore/packstore.go`, `gc.go`, `compact.go`, `markset.go`, `missing.go`, `repair.go`, `packstore_test.go`.
+
+**Interfaces:**
+
+```go
+type foreignActive struct {            // another writer's segment, read-only
+	id         uint64
+	path       string
+	f          *os.File
+	index      map[key.Key]activeLoc
+	dataEnd    int64
+	sidecarEnd int64
+}
+// Store gains: foreign []*foreignActive (guarded by mu), refreshMu sync.Mutex, refreshSeq uint64.
+
+func (s *Store) refresh() error                       // re-list; map new sealed; retire vanished; extend/add/drop foreign actives
+func (s *Store) lookup(k key.Key) (where, bool)       // own active, foreign actives, sealed newest-first; caller holds mu
+func (s *Store) ensureActiveLocked() error            // adopt (largest unlocked first) or create; called under appendMu
+func allocateSegment(dir string, after uint64) (id uint64, f *os.File, err error) // O_EXCL, retry on EEXIST
+```
+
+`Open`: shared `flock` on the directory (non-blocking; failure means a pre-change binary holds it), then `refresh()` builds the first view; nothing else is locked and no file is modified. The first write calls `ensureActiveLocked`. `Close` releases the owned segment by closing its file after the final fsync and `synced` marker.
+
+Public lookups: on a miss, drop `mu`, `refresh()` (coalesced: a caller that waited on `refreshMu` and sees `refreshSeq` moved skips its own), retry once. `Missing` and `SortByLocation` refresh once per call when they saw any miss. `hasLocal` (the write path) never refreshes.
+
+Every walk that today visits "the active segment" visits the owned one and the foreign ones: `NewMarkSet`, `HasOutside`, `Liveness`, `locateLocked`, `StoredSize`, `GetRecord`, `copyLive`'s `survivorHas`. `PutVerified` repairs only segments this store can write: its own active or sealed ones; a damaged record in a foreign active segment is reported, not repaired.
+
+Retiring a vanished sealed segment reuses `Remove`'s discipline (detach under `mu`, unmap after scrubs).
+
+**Tests (`multi_test.go`; two stores on one directory stand in for two processes):**
+- `TestTwoStoresOpenOneDirectory` (replaces `TestSecondOpenFails`).
+- `TestManyActiveSegmentsOpen` (replaces `TestMultipleActiveFilesFailOpen`).
+- `TestOldExclusiveDirectoryLockIsRefused` (Review Focus 5): with a store open, `flock(LOCK_EX|LOCK_NB)` on the directory fails; with that lock held by the test, `Open` fails with a message naming an older release.
+- `TestSecondWriterCreatesItsOwnSegment`, `TestWriterAdoptsTheLargestUnlockedSegment`, `TestSerialWritersFillOneSegment` (three open-write-close rounds leave one active file).
+- `TestConcurrentCreatorsGetDistinctIDs` (8 stores, first write at once).
+- `TestAdopterCompletesACrashedSeal`.
+- `TestReaderSeesWhatAnotherWroteAfterItOpened` (own miss, refresh, hit), for a record in a foreign active segment and for one in a segment sealed since.
+- `TestReaderHoldsNoLock`: a reader open on a store does not stop a writer from adopting the only active segment.
+- `TestLongLivedReaderSurvivesSealAndCompaction` (Review Focus 3).
+- `TestDedupDoesNotRefresh`: counts refreshes across a `WriteBatch` of new keys: zero.
+- `TestMissingRefreshesOnce`.
+- `process_test.go`: `TestSecondProcessWritesAreVisible` (re-exec helper as in `refstore`).
+
+- [ ] Tests first, implement, full `go test ./...` and race over `packstore`, `gc`; commit `packstore: many active segments; writers adopt, readers refresh on a miss`.
+
+---
+
+### Task 4: the cross-process gate and the view generation
+
+**Files:** create `packstore/gate.go`, `packstore/gate_test.go`; modify `packstore/packstore.go`, `gc.go`, `compact.go`.
+
+**Interfaces:**
+
+```go
+// BeginWrite marks a write span: it holds gc.lock shared (unless this store
+// holds it exclusively) until done is called. Every exported write takes one
+// itself; callers bracket larger spans, such as a completeness walk followed
+// by a reference put. If the view generation moved, the view is refreshed
+// before BeginWrite returns.
+func (s *Store) BeginWrite() (done func(), err error)
+
+// BeginSweep takes gc.lock exclusively for a GC cycle or a wipe: it waits
+// out local spans, then other processes', refreshes the view, and returns.
+// done bumps the generation, waits out local spans again and unlocks.
+func (s *Store) BeginSweep(ctx context.Context) (done func(), err error)
+```
+
+`gate` state per store: `shared int`, `exclusive bool`, `blocked bool` (new local spans wait), a `sync.Cond`. Transitions: first local span with `!exclusive` polls `LOCK_SH`; last one unlocks. `BeginSweep`: set `blocked`, wait `shared == 0`, poll `LOCK_EX`, set `exclusive`, clear `blocked`. Its `done`: set `blocked`, wait `shared == 0`, write generation+1, unlock, clear both. `Compact` additionally blocks new local spans and waits for the ones in flight before it takes `appendMu`, which closes the long-standing in-process exposure of writes that bypass the collector.
+
+`Wipe` runs inside `BeginSweep`.
+
+**Tests (`gate_test.go`):**
+- `TestWriteSpanBlocksAForeignSweep` and `TestSweepBlocksAForeignWriteSpan` (two stores; bounded waits asserted with channels, not sleeps).
+- `TestLocalSpansRunDuringALocalSweepLock`: with `BeginSweep` held, a `Put` on the same store completes.
+- `TestNestedSpansCount`.
+- `TestBeginSweepHonoursContext`.
+- `TestGenerationMovesOnSweepAndWipe`.
+- `TestStaleWriterRefreshesBeforeDedup` (Review Focus 4): store B maps segment X holding K; store A reaps X with K dead; B then writes K: the record must exist afterwards in a live segment. A subtest disables the generation check through a test hook and shows K lost, so the test is known to bite.
+- `TestWipeUnderTheGate`.
+
+- [ ] Tests first, implement, race run, commit `packstore: gc.lock gates writers against a sweep across processes; view generation`.
+
+---
+
+### Task 5: the collector across processes
+
+**Files:** modify `gc/collector.go`, `gc/cycle.go`, `packstore/compact.go`; create `gc/multi_test.go`.
+
+`cycle`: under the first `refLock.Lock()` call `objects.BeginSweep(ctx)`; hold it until the end of the cycle; its `done` runs under `refLock.Lock()` on every exit path (the sweep already holds it; the abort paths take it briefly). `BeginWrite` and `PrepareRef` take `objects.BeginWrite()` inside their `refLock.RLock()`. `Compact` seals the owned active segment and then adopts and seals every unlocked one before it selects victims.
+
+**Tests (`multi_test.go`; two store/refstore/collector triples on one directory):**
+- `TestCycleWaitsForAForeignWriteSpan`, `TestForeignPrepareRefWaitsForACycle`.
+- `TestCollectWhileAnotherStoreIngests`: A ingests trees and publishes references, deletes some; B runs cycles at `--garbage 0`, grace 0; afterwards every surviving reference is complete from both views and the deleted data is gone.
+- `TestIdleForeignActiveSegmentIsCollected`, `TestOwnedForeignActiveSegmentIsLeftAlone`.
+- `TestLocalIngestRunsThroughTheMark` (existing barrier behaviour, now with the gate in place).
+- Existing `gc` suite passes unchanged.
+
+- [ ] Tests first, implement, race run over `packstore`, `refstore`, `gc`, commit `gc: a cycle holds the cross-process gate; idle active segments are sealed and collected`.
+
+---
+
+### Task 6: documentation and measurements
+
+- `architecture/packstore.md` (new): directory layout, the sidecar format and its reading and writing rules, ownership and adoption, views and refresh, `gc.lock` and the generation, compatibility. Written so that `core-rs` can implement it.
+- `architecture/mark-sweep-gc.md`: "Across processes" section (quiesce for foreign writers, barrier for local ones; why `flock` is never converted).
+- `specs/gc.qnt`: header comment noting that foreign writers are held to the *quiesce* policy the model already checks; no model change.
+- `README.md` package table and the store-layout paragraph; `CLAUDE.md`: open cost before and after, and the multi-process note under Benchmarks.
+- [ ] Full verification with exit status preserved: `go test ./...`, `go test -race ./packstore ./refstore ./gc`, `go vet ./...`, `gofmt -l .`, `go test ./cmd/amber-bench`.
+- [ ] Commit `docs: the packstore's on-disk layout and multi-process protocol`.
