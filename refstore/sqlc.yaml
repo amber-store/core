@@ -1,0 +1,11 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema: "migrations"
+    queries: "queries.sql"
+    gen:
+      go:
+        package: "refsdb"
+        out: "internal/refsdb"
+        omit_sqlc_version: true
+        emit_empty_slices: true
