@@ -118,3 +118,51 @@ func TestPrepareRefMissingAncestorFails(t *testing.T) {
 		t.Fatal("PrepareRef accepted a commit whose parent is missing")
 	}
 }
+
+// A plain directory may hold a commit as the content key of a directory
+// entry. Whatever keeps that directory alive keeps the commit, its tree and
+// its ancestors alive; the walks follow content keys whatever their type.
+func TestTreeHoldingACommitKeepsItsHistoryLive(t *testing.T) {
+	ts := newTestStore(t, 4<<10)
+	c := ts.openCollector(t, Options{Grace: time.Hour})
+	treeOld, keysOld := storeDirTree(t, ts.objects, "old", 40)
+	treeNew, keysNew := storeDirTree(t, ts.objects, "new", 40)
+	_, keysDead := storeDirTree(t, ts.objects, "dead", 40) // never referenced
+	first := storeCommit(t, ts.objects, treeOld)
+	tip := storeCommit(t, ts.objects, treeNew, first)
+	holder, err := fstree.EncodeDirLeaf([]fstree.Entry{{Name: []byte("vendor"), Mode: 0o040755, ContentKey: tip[:]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.objects.Put(holder.Key, holder.Bytes); err != nil {
+		t.Fatal(err)
+	}
+	putTestRef(t, c, ts.refs, "site", holder.Key) // the completeness walk goes through the commit too
+
+	backdatePacks(t, ts)
+	stats, err := c.Run(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.Reaped) == 0 {
+		t.Fatalf("nothing reaped: %+v", stats)
+	}
+	live := append(append(slices.Clone(keysOld), keysNew...), first, tip, holder.Key)
+	for _, k := range live {
+		if _, err := ts.objects.Get(k); err != nil {
+			t.Fatalf("key %s, reachable through the commit the directory holds: %v", k, err)
+		}
+	}
+	if countGone(t, ts.objects, keysDead) == 0 {
+		t.Error("no unreferenced key was collected, so the test proves nothing")
+	}
+
+	rmTestRef(t, c, ts.refs, "site", holder.Key)
+	backdatePacks(t, ts)
+	if _, err := c.Run(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if countGone(t, ts.objects, keysOld) == 0 || countGone(t, ts.objects, keysNew) == 0 {
+		t.Error("the held commit's history was not collected after the directory's reference went")
+	}
+}
