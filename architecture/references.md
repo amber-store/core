@@ -39,23 +39,70 @@ rules as names, but `@` is allowed for email-style identities); a signature
 may be at most 64 KiB. Decoders reject records whose bytes are not the
 canonical deterministic encoding.
 
-**Mutability:** references are overwritable; a put for an existing name
-replaces the record unconditionally. There is no history.
+**Mutability:** references are overwritable; a plain put for an existing name
+replaces the record unconditionally. There is no history. A writer that must
+not overwrite somebody else's move uses the **optimistic** forms instead:
+move the reference only if it still points at the key the writer last saw,
+create it only if it does not exist, delete it only if it still points at a
+given key. The comparison is on the pointed-to key, not on the whole record.
+A failed expectation changes nothing and is reported to the caller, who
+re-reads and decides.
 
 ## Storage
 
-References live in a Pebble DB (the `refstore` package), conventionally at
-`<store-dir>/refs/` next to the object store: DB key = name bytes, value =
-the CBOR record verbatim. Write durability follows the store's sync flag.
-Listing is an iterator scan in lexicographic name order.
+References live in a SQLite database (the `refstore` package), conventionally
+`<store-dir>/refs/refs.sqlite` next to the object store. The file is the
+interchange format: every implementation reads and writes the same database.
+
+| Property | Value |
+| --- | --- |
+| `PRAGMA application_id` | `0x616D6272` (`"ambr"`) |
+| `PRAGMA user_version` | number of schema migrations applied; `1` today |
+| Journal mode | WAL, mandatory |
+| Schema at version 1 | `CREATE TABLE refs (name BLOB NOT NULL PRIMARY KEY, record BLOB NOT NULL) WITHOUT ROWID` |
+
+`name` is the reference name's bytes and `record` the CBOR record verbatim;
+both are BLOBs, never NULL or TEXT, so listing (`ORDER BY name`) is bytewise
+lexicographic. An implementation refuses a file whose application id differs
+or whose version is newer than it knows.
+
+The schema is built by numbered SQL files (`refstore/migrations/`), applied in
+order inside one `BEGIN IMMEDIATE` transaction that ends by setting
+`user_version`; a fresh database starts at version 0. Files never change once
+released, and a change must stay compatible with the release before it, since
+a process that opened the store earlier keeps running its old queries.
+
+WAL mode makes the store multi-process: any number of processes may hold it
+open, readers work from a snapshot and never block, and write transactions
+run one at a time — a second writer waits (30 s busy timeout). A batch is one
+transaction. Opening an up-to-date store takes no write lock, so it never
+waits for a writer. One wrinkle: switching a new database into WAL mode takes
+an exclusive lock for which SQLite does not run its busy handler, so an
+implementation must retry a busy error while it connects, or concurrent
+first opens fail. Write durability follows the store's sync flag:
+`synchronous=FULL` with `fullfsync` and `checkpoint_fullfsync` on, or
+`synchronous=NORMAL` without.
+
+**Stores written before this format** kept references in a Pebble DB in the
+same directory. The first open imports them into `refs.sqlite`, moves the
+Pebble files to `refs/pebble-migrated/` (a backup the operator may delete)
+and leaves `marker.format-version.999999.999` behind. That marker makes
+Pebble refuse the directory, so a binary that predates the change fails
+loudly instead of creating an empty store — from which a `gc run` would reap
+every object. `refs/migrate.lock` serializes concurrent first opens.
 
 ## CLI
 
 ```sh
 amber-store ingest --ref NAME DIR    # ingest and name the root
 amber-store ref set NAME KEY         # name an existing key
+amber-store ref set --expect OLD NAME KEY   # only if NAME still points at OLD
+amber-store ref set --expect none NAME KEY  # only if NAME does not exist
 amber-store ref list                 # name, key, date, user
 amber-store ref get NAME             # print the key NAME points at
 amber-store ref rm NAME              # delete the name; objects stay
+amber-store ref rm --expect OLD NAME # only if NAME still points at OLD
 amber-store ls ref:NAME[@PATH]       # any KEY[/PATH] argument accepts this
 ```
+
+`--expect` goes before the positional arguments.

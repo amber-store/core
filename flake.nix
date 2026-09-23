@@ -29,8 +29,9 @@
           '';
           hardeningDisable = [ "all" ];
 
-          # nodejs builds the embedded admin SPA (go generate ./cmd/amber-store)
-          packages = with pkgs; [ go nodejs python3 ];
+          # nodejs builds the embedded admin SPA (go generate ./cmd/amber-store);
+          # sqlc regenerates refstore/internal/refsdb (go generate ./refstore)
+          packages = with pkgs; [ go nodejs python3 sqlc ];
         };
       });
     };

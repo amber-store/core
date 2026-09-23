@@ -75,7 +75,7 @@ directory is **single-owner**: never open one from two live processes.
 | `ingest` | Build a tree from a local directory (or single file): `Objects` streams every built object plus the resolved root; `Dir` writes straight into a packstore; `Scan` sizes progress displays. Honors `.amberignore`; `Opts.Exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
 | `packstore` | The local object store: append-only pack segments with parallel, deduplicating, verifying writers. |
-| `refstore` | Pebble-backed name → record map for references. |
+| `refstore` | SQLite-backed (WAL, multi-process) name → record map for references, with optimistic updates. |
 | `reference` | The reference record: canonical CBOR encoding and validation; signature fields carried opaquely. |
 | `amberpack` | The flat pack stream format (`key + payload` records, no root) used for transfer and storage. |
 | `inbox` | Durable pack receiving: persist incoming packs, then drain them into a packstore. |
@@ -115,6 +115,7 @@ amber-store --store ./store export ref:backups/home -o tree.tar  # PAX tar (defa
 amber-store --store ./store restore ref:backups/home ./dest      # recreate the tree on disk
 amber-store --store ./store ref list                    # references: name, key, created, user
 amber-store --store ./store ref set NAME KEY            # name an existing key
+amber-store --store ./store ref set --expect OLD NAME KEY  # move NAME only if it still points at OLD ('none': only create)
 amber-store --store ./store ref get NAME                # print the key a name points at
 amber-store --store ./store ref rm NAME                 # delete the name; objects stay
 amber-store --store ./store commit create --ref main --author 'Ann <ann@example.com>' -m 'first' KEY  # record a tree; --parent KEY|ref:NAME links history

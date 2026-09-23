@@ -2273,3 +2273,26 @@ Expected: no diff, no sqlc output, every package `ok`, no vet or gofmt output.
 git add flake.nix .github/workflows/test.yml architecture/references.md README.md
 git commit -m "docs, ci: the SQLite reference store; sqlc in the dev shell and a drift check"
 ```
+
+---
+
+## Amendments during execution
+
+- **WAL switch race (after Task 3).** `go test -race ./refstore` failed in
+  `TestConcurrentOpensMigrateOnce` with "database is locked": switching a
+  database into WAL mode takes an exclusive lock for which SQLite does not
+  run the busy handler. `refstore/sqlite.go` gained `connect` (retry while
+  busy, 1 ms doubling to 50 ms, bounded by `busyTimeout`) and `isBusy`, and
+  `refstore/sqlite_test.go` gained `TestConcurrentFirstOpens` (8 opens of a
+  fresh directory, 10 rounds), which failed on round 0 before the fix. It is
+  its own commit. The driver import in `sqlite.go` is no longer blank.
+- **Task 2 test.** `TestConcurrentSwapsHaveOneWinner` encodes its records
+  before starting the goroutines, because the `record` helper calls
+  `t.Fatal`, which must not run off the test goroutine.
+- **Task 3 tests** also assert that `refs.sqlite.tmp` is gone after a
+  migration and that an empty legacy store leaves no `LOCK` behind.
+- **Task 4.** `rmRef` releases the expected key after a conditional delete:
+  what was deleted pointed there, whatever the earlier read said.
+- **Lesson.** One verification command in this plan piped `go test` into
+  `tail` without `pipefail`, which let a failing race run through to a
+  commit. Verification commands must not hide the exit status.

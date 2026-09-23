@@ -121,6 +121,15 @@ file lock.
 Write transactions begin with `BEGIN IMMEDIATE`, so a transaction never has
 to upgrade a read lock and cannot deadlock against another writer.
 
+Switching a database into WAL mode, which the first open of a new or a
+freshly imported store does, takes an exclusive lock for which SQLite does
+**not** run the busy handler: of several opens racing on such a store all but
+one fail at once with "database is locked". The first connection therefore
+retries a busy error with a short backoff, for as long as a writer would
+wait. Once the file is in WAL mode the pragma is a no-op and never waits.
+(Found by the race-detector run during implementation; pinned by
+`TestConcurrentFirstOpens`.)
+
 The API's guarantees carry over, now across processes as well:
 
 - `PutBatch` is one transaction: a reader sees none or all of a batch.
