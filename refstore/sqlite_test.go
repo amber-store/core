@@ -197,3 +197,35 @@ func TestOpenRejectsNonDatabaseFile(t *testing.T) {
 		t.Fatal("Open(garbage file) succeeded")
 	}
 }
+
+// Switching a database into WAL mode takes an exclusive lock for which SQLite
+// does not run the busy handler, so of several first opens of one store all
+// but one used to fail with "database is locked".
+func TestConcurrentFirstOpens(t *testing.T) {
+	for round := range 10 {
+		dir := t.TempDir()
+		const n = 8
+		stores := make([]*refstore.Store, n)
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() { stores[i], errs[i] = refstore.Open(dir, false) })
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d, open %d: %v", round, i, err)
+			}
+			if err := stores[i].Put(fmt.Sprintf("from-%d", i), []byte("v")); err != nil {
+				t.Fatalf("round %d, put %d: %v", round, i, err)
+			}
+		}
+		all, err := stores[0].All()
+		if err != nil || len(all) != n {
+			t.Fatalf("round %d: %d records, %v; want %d", round, len(all), err, n)
+		}
+		for _, s := range stores {
+			s.Close()
+		}
+	}
+}

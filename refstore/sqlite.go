@@ -3,13 +3,14 @@ package refstore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite" // the pure-Go SQLite driver, registered as "sqlite"
+	"modernc.org/sqlite" // the pure-Go SQLite driver, registered as "sqlite"
 )
 
 const (
@@ -19,6 +20,8 @@ const (
 	applicationID = 0x616d6272
 	// maxConns caps the connection pool; each connection is a file handle.
 	maxConns = 8
+	// sqliteBusy is SQLite's primary result code SQLITE_BUSY.
+	sqliteBusy = 5
 )
 
 // busyTimeout bounds how long a write waits for another connection's —
@@ -77,7 +80,7 @@ func openDB(path string, syncWrites, wal bool) (*sql.DB, error) {
 
 func prepare(db *sql.DB, path string, wal bool) error {
 	ctx := context.Background()
-	conn, err := db.Conn(ctx)
+	conn, err := connect(ctx, db)
 	if err != nil {
 		return fmt.Errorf("refstore: opening sqlite %s: %w", path, err)
 	}
@@ -95,6 +98,30 @@ func prepare(db *sql.DB, path string, wal bool) error {
 		return fmt.Errorf("%w (%s)", err, path)
 	}
 	return nil
+}
+
+// connect takes the pool's first connection, retrying while SQLite reports
+// the database busy. The driver applies the DSN's pragmas as it connects, and
+// switching a database into WAL mode — which the first open of a new or a
+// freshly imported store does — takes an exclusive lock for which SQLite does
+// not run the busy handler: of several processes opening such a store at
+// once, all but one fail immediately. They retry here, for as long as a
+// writer would wait. Once the file is in WAL mode the pragma changes nothing
+// and never waits.
+func connect(ctx context.Context, db *sql.DB) (*sql.Conn, error) {
+	deadline := time.Now().Add(busyTimeout)
+	for delay := time.Millisecond; ; delay = min(2*delay, 50*time.Millisecond) {
+		conn, err := db.Conn(ctx)
+		if err == nil || !isBusy(err) || time.Now().After(deadline) {
+			return conn, err
+		}
+		time.Sleep(delay)
+	}
+}
+
+func isBusy(err error) bool {
+	var se *sqlite.Error
+	return errors.As(err, &se) && se.Code()&0xff == sqliteBusy
 }
 
 // blob maps a nil slice to an empty one: the driver binds nil as NULL, and
