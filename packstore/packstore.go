@@ -96,9 +96,13 @@ type Store struct {
 	// structEpoch counts the changes this store itself made to the view, so
 	// that a refresh that raced one only adds (view.go). Guarded by mu.
 	structEpoch uint64
-	nextID      uint64 // a floor for new segment ids; under appendMu
-	closed      bool
-	failed      error // sticky write-path failure; written under appendMu+mu, read under either
+	// dirMtime is the directory's modification time as of the view's last
+	// listing, taken at listedAt; together they let a lookup that finds
+	// nothing skip the next listing (viewIsCurrent). Guarded by mu.
+	dirMtime, listedAt time.Time
+	nextID             uint64 // a floor for new segment ids; under appendMu
+	closed             bool
+	failed             error // sticky write-path failure; written under appendMu+mu, read under either
 
 	// scrubMu/scrubN/scrubC track in-flight lock-free mmap walks (Verify,
 	// ScanIndex, Record): Close/Wipe/Remove wait for scrubN to reach 0 before

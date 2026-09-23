@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/key"
@@ -30,6 +31,13 @@ var errStaleView = errors.New("packstore: an active segment's index does not mat
 // tmpSuffix marks an active segment that is still being created (active.go).
 const tmpSuffix = ".tmp"
 
+// racyWindow is how old the directory's modification time must be, when the
+// directory is listed, before an unchanged time is taken to mean an unchanged
+// directory. On a filesystem with one-second timestamps a segment created in
+// the same second as the listing would otherwise go unnoticed for good. (The
+// trick, and the name, are git's, for its index.) A variable for the tests.
+var racyWindow = 2 * time.Second
+
 // foreignActive is an active segment this store does not own — another
 // writer's, or one nobody holds at the moment — indexed for reading.
 type foreignActive struct {
@@ -38,6 +46,9 @@ type foreignActive struct {
 	f    *os.File    // read-only; follows the file through a seal's rename
 	fi   os.FileInfo // identity: an id can come back as another file
 	scan *segmentScan
+	// seenSize is the data file's length at the last look; a different one
+	// now means its owner appended. Written under the store's mu.
+	seenSize int64
 }
 
 type segFile struct {
@@ -126,39 +137,39 @@ func openForeign(id uint64, sf segFile) (*foreignActive, *sealedSegment, error) 
 		f.Close()
 		return nil, nil, err
 	}
-	return &foreignActive{id: id, path: sf.path, f: f, fi: fi, scan: res.scan()}, nil, nil
+	return &foreignActive{id: id, path: sf.path, f: f, fi: fi, scan: res.scan(), seenSize: res.fileSize}, nil, nil
 }
 
 // poll reads what the segment's owner appended since the view last looked
 // and returns the entries to add. ok is false when the view has to be built
 // again. The index is not touched: the caller extends it under the store's
 // lock.
-func (fa *foreignActive) poll() (added []sidecarRec, ok bool, err error) {
+func (fa *foreignActive) poll() (added []sidecarRec, size int64, ok bool, err error) {
 	var tail []byte
 	sf, err := os.Open(fa.path + sidecarSuffix)
 	switch {
 	case errors.Is(err, fs.ErrNotExist): // no sidecar, or gone with a seal: the data's tail still reads
 	case err != nil:
-		return nil, false, err
+		return nil, 0, false, err
 	default:
 		defer sf.Close()
 		st, err := sf.Stat()
 		if err != nil {
-			return nil, false, err
+			return nil, 0, false, err
 		}
 		if st.Size() < fa.scan.sidecarEnd {
-			return nil, false, nil // started over by a new owner
+			return nil, 0, false, nil // started over by a new owner
 		}
 		if tail, err = readRange(sf, fa.scan.sidecarEnd, st.Size()-fa.scan.sidecarEnd); err != nil {
-			return nil, false, err
+			return nil, 0, false, err
 		}
 	}
 	st, err := fa.f.Stat() // after the sidecar: the data covers whatever it speaks of
 	if err != nil {
-		return nil, false, err
+		return nil, 0, false, err
 	}
 	added, _, ok, err = fa.scan.advance(fa.f, st.Size(), tail)
-	return added, ok, err
+	return added, st.Size(), ok, err
 }
 
 // read returns the stored payload of the record loc names, after checking
@@ -191,6 +202,9 @@ func (fa *foreignActive) readRecord(k key.Key, loc activeLoc) ([]byte, error) {
 // Callers that waited for somebody else's refresh do not repeat it: that
 // listing is newer than their miss.
 func (s *Store) refreshAfterMiss(rebuild bool) error {
+	if !rebuild && s.viewIsCurrent() {
+		return nil
+	}
 	seq := s.refreshSeq.Load()
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -198,6 +212,40 @@ func (s *Store) refreshAfterMiss(rebuild bool) error {
 		return nil
 	}
 	return s.refreshLocked(rebuild)
+}
+
+// viewIsCurrent reports, for the price of a stat or two, that nothing another
+// store did can have changed what this view holds: the directory has not been
+// modified since it was listed, so no segment appeared, vanished or was
+// replaced, and no active segment this store reads has grown. Listing the
+// directory costs a stat per segment; a lookup that finds nothing is common
+// enough (any "do you have this?") that it must not pay that every time.
+func (s *Store) viewIsCurrent() bool {
+	type probe struct {
+		f    *os.File
+		size int64
+	}
+	s.mu.RLock()
+	mtime, listedAt := s.dirMtime, s.listedAt
+	probes := make([]probe, len(s.foreign))
+	for i, fa := range s.foreign {
+		probes[i] = probe{fa.f, fa.seenSize}
+	}
+	s.mu.RUnlock()
+	if listedAt.Sub(mtime) < racyWindow {
+		return false // modified too close to the listing for its time to prove anything
+	}
+	st, err := os.Stat(s.dir)
+	if err != nil || !st.ModTime().Equal(mtime) {
+		return false
+	}
+	for _, p := range probes {
+		st, err := p.f.Stat() // a view dropped meanwhile fails here, which is an answer too
+		if err != nil || st.Size() != p.size {
+			return false
+		}
+	}
+	return true
 }
 
 // refresh brings the view up to date unconditionally.
@@ -237,6 +285,13 @@ func (s *Store) refreshLocked(rebuild bool) error {
 	}
 	s.mu.RUnlock()
 
+	// The directory's time before its listing: a change that falls between
+	// the two then shows as a time this view has not caught up with.
+	dirInfo, err := os.Stat(s.dir)
+	if err != nil {
+		return err
+	}
+	listedAt := time.Now()
 	ls, err := listSegments(s.dir)
 	if err != nil {
 		return err
@@ -244,6 +299,7 @@ func (s *Store) refreshLocked(rebuild bool) error {
 	type delta struct {
 		fa    *foreignActive
 		added []sidecarRec
+		size  int64
 	}
 	var (
 		opened        []*sealedSegment
@@ -284,14 +340,14 @@ func (s *Store) refreshLocked(rebuild bool) error {
 			continue
 		}
 		if fa := haveForeign[id]; fa != nil && !rebuild && os.SameFile(fa.fi, sf.info) {
-			added, ok, err := fa.poll()
+			added, size, ok, err := fa.poll()
 			if err != nil {
 				discard()
 				return err
 			}
 			if ok {
 				keepForeign[id] = true
-				deltas = append(deltas, delta{fa, added})
+				deltas = append(deltas, delta{fa, added, size})
 				continue
 			}
 		}
@@ -344,7 +400,9 @@ func (s *Store) refreshLocked(rebuild bool) error {
 		for _, r := range d.added {
 			d.fa.scan.index[r.k] = r.loc()
 		}
+		d.fa.seenSize = d.size
 	}
+	s.dirMtime, s.listedAt = dirInfo.ModTime(), listedAt
 	var foreign, dropped []*foreignActive
 	isOwn := func(id uint64) bool { return s.active != nil && s.active.id == id }
 	for _, fa := range s.foreign {

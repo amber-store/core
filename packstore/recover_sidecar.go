@@ -33,6 +33,7 @@ type recovered struct {
 	durable    int64        // data length the sidecar knows durable
 	missing    []sidecarRec // valid records the agreeing part of the sidecar does not list, in data order
 	sealed     bool         // the data file carries a complete footer: a seal's rename is outstanding
+	fileSize   int64        // the data file's length when it was looked at
 }
 
 func (r recovered) scan() *segmentScan {
@@ -62,9 +63,12 @@ func recoverSegment(path string) (recovered, error) {
 		return recovered{}, err
 	}
 	if ok {
+		res.fileSize = st.Size()
 		return res, nil
 	}
-	return fullScan(path)
+	res, err = fullScan(path)
+	res.fileSize = st.Size()
+	return res, err
 }
 
 // fullScan is recovery without a sidecar: every record is read and checked.

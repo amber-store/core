@@ -381,3 +381,69 @@ func TestStaleTemporarySegmentIsRemoved(t *testing.T) {
 		t.Fatalf("the temporary file of a crashed creation is still there: %v", err)
 	}
 }
+
+// zeroRacyWindow lets the tests below reach the fast path at once: a fresh
+// test directory was modified a moment ago, which the default window, meant
+// for filesystems with coarse timestamps, does not trust yet.
+func zeroRacyWindow(t *testing.T) {
+	t.Helper()
+	old := racyWindow
+	racyWindow = 0
+	t.Cleanup(func() { racyWindow = old })
+}
+
+// A lookup that finds nothing must not list the directory when nothing in it
+// can have changed: listing costs a stat per segment, a thousand times a miss.
+func TestMissesDoNotListAnUnchangedDirectory(t *testing.T) {
+	zeroRacyWindow(t)
+	dir := t.TempDir()
+	w, err := Open(dir, WithSync(false), WithSegmentSize(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs := testObjects(t, 40)
+	putAll(t, w, objs[:3])
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := openStore(t, dir)
+	before := s.refreshes.Load()
+	for _, o := range objs[3:] {
+		if has, err := s.Has(o.Key); err != nil || has {
+			t.Fatalf("Has = %v, %v", has, err)
+		}
+		if _, err := s.Get(o.Key); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Get = %v", err)
+		}
+	}
+	if got := s.refreshes.Load() - before; got != 0 {
+		t.Fatalf("%d lookups that found nothing listed an unchanged directory %d times", 2*len(objs[3:]), got)
+	}
+}
+
+func TestFastPathStillSeesOtherStoresWrites(t *testing.T) {
+	zeroRacyWindow(t)
+	dir := t.TempDir()
+	reader := openStore(t, dir)
+	objs := testObjects(t, 5)
+
+	w := openStore(t, dir, WithSync(false))
+	putAll(t, w, objs[:1])
+	wantObjects(t, reader, objs[:1]) // a new active segment: the directory changed
+	putAll(t, w, objs[1:2])
+	wantObjects(t, reader, objs[1:2]) // the same segment grew: only its size changed
+
+	sealer := openStore(t, dir, WithSync(false), WithSegmentSize(1))
+	putAll(t, sealer, objs[2:3])
+	wantObjects(t, reader, objs[2:3]) // a segment created and sealed in one go
+
+	before := reader.refreshes.Load()
+	if has, err := reader.Has(objs[4].Key); err != nil || has {
+		t.Fatalf("Has = %v, %v", has, err)
+	}
+	if got := reader.refreshes.Load() - before; got != 0 {
+		t.Fatal("a miss listed a directory that had not changed")
+	}
+	putAll(t, w, objs[3:4])
+	wantObjects(t, reader, objs[3:4]) // and the fast path did not stick
+}
