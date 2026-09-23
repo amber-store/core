@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/key"
 	"github.com/zeebo/blake3"
 )
@@ -91,10 +92,12 @@ func (g *sealedSegment) verify(ctx context.Context) error {
 }
 
 // verifyObject recomputes o.Key from o.Data and reports ErrVerify on mismatch.
-// For Blob, XattrSet and Commit — whose key length is the serialized byte
-// length — it also checks the length field. Aggregate types
-// (FileNode/DirLeaf/DirNode) carry a logical length the store cannot recompute
-// without parsing, so only their hash is checked.
+// For Blob and XattrSet, whose key length is the serialized byte length, it
+// also checks the length field; and for Commit, whose length is a footprint —
+// own bytes plus the trees it records — which the commit's own bytes suffice
+// to recompute. A commit that does not decode fails verification. The other
+// aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the store
+// does not recompute, so only their hash is checked.
 func verifyObject(o Object) error {
 	sum := blake3.Sum256(o.Data)
 	want, err := key.NewFromHash(o.Key.Type(), o.Key.Length(), sum)
@@ -105,9 +108,21 @@ func verifyObject(o Object) error {
 		return fmt.Errorf("%w: payload hashes to %s, not %s", ErrVerify, want, o.Key)
 	}
 	switch o.Key.Type() {
-	case key.Blob, key.XattrSet, key.Commit:
+	case key.Blob, key.XattrSet:
 		if o.Key.Length() != uint64(len(o.Data)) {
 			return fmt.Errorf("%w: %s length field %d != payload %d", ErrVerify, o.Key, o.Key.Length(), len(o.Data))
+		}
+	case key.Commit:
+		c, err := commit.Decode(o.Data)
+		if err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrVerify, o.Key, err)
+		}
+		want, err := commit.Footprint(uint64(len(o.Data)), c.Trees())
+		if err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrVerify, o.Key, err)
+		}
+		if o.Key.Length() != want {
+			return fmt.Errorf("%w: %s length field %d != footprint %d (own %d bytes plus its trees)", ErrVerify, o.Key, o.Key.Length(), want, len(o.Data))
 		}
 	}
 	return nil
