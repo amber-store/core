@@ -216,11 +216,75 @@ func TestConcurrentOpensMigrateOnce(t *testing.T) {
 		wg.Go(func() { stores[i], errs[i] = refstore.Open(dir, false) })
 	}
 	wg.Wait()
+	for _, s := range stores {
+		if s != nil {
+			t.Cleanup(func() { s.Close() })
+		}
+	}
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("open %d: %v", i, err)
 		}
-		t.Cleanup(func() { stores[i].Close() })
 		wantRecords(t, stores[i], want)
+	}
+}
+
+// A Pebble store that an old binary still has open cannot be migrated: it
+// must be left exactly as it is.
+func TestMigrationRefusesAStoreInUse(t *testing.T) {
+	dir := t.TempDir()
+	legacyStore(t, dir, map[string]string{"a": "1"}, nil)
+	inUse, err := pebble.Open(dir, &pebble.Options{Logger: quietLogger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := refstore.Open(dir, false); err == nil {
+		inUse.Close()
+		t.Fatal("Open migrated a Pebble store that another owner holds open")
+	}
+	for _, name := range []string{"refs.sqlite", "marker.format-version.999999.999", "pebble-migrated"} {
+		if exists(t, filepath.Join(dir, name)) {
+			t.Errorf("the refused migration left %s behind", name)
+		}
+	}
+	if err := inUse.Set([]byte("b"), []byte("2"), pebble.Sync); err != nil {
+		t.Fatalf("the old owner can no longer write: %v", err)
+	}
+	if err := inUse.Close(); err != nil {
+		t.Fatal(err)
+	}
+	wantRecords(t, open(t, dir), map[string]string{"a": "1", "b": "2"})
+}
+
+func TestStaleTemporaryDatabaseIsReplaced(t *testing.T) {
+	dir := t.TempDir()
+	legacyStore(t, dir, map[string]string{"a": "1"}, nil)
+	for _, name := range []string{"refs.sqlite.tmp", "refs.sqlite.tmp-journal"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("left by a crashed import"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantRecords(t, open(t, dir), map[string]string{"a": "1"})
+	if exists(t, filepath.Join(dir, "refs.sqlite.tmp")) {
+		t.Error("the stale temporary database is still there")
+	}
+}
+
+// A power loss can undo part of the move, leaving Pebble files without the
+// manifest marker next to the finished database.
+func TestLeftoverPebbleFilesAreRetired(t *testing.T) {
+	dir := t.TempDir()
+	legacyStore(t, dir, map[string]string{"a": "1"}, nil)
+	open(t, dir).Close()
+	for _, name := range []string{"LOCK", "000123.sst", "OPTIONS-000042"} {
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantRecords(t, open(t, dir), map[string]string{"a": "1"})
+	for _, name := range []string{"LOCK", "000123.sst", "OPTIONS-000042"} {
+		if exists(t, filepath.Join(dir, name)) {
+			t.Errorf("%s was left in the store directory", name)
+		}
 	}
 }

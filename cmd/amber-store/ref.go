@@ -58,10 +58,16 @@ type expectation struct {
 	key         key.Key // otherwise it must point here
 }
 
-func parseExpect(s string, allowNone bool) (expectation, error) {
+func parseExpect(c *cli.Context, allowNone bool) (expectation, error) {
+	if !c.IsSet("expect") {
+		return expectation{}, nil
+	}
+	s := c.String("expect")
 	switch {
 	case s == "":
-		return expectation{}, nil
+		// A script's unset variable. It must not quietly turn the write
+		// into an unconditional one.
+		return expectation{}, errors.New("--expect is empty: it takes the key the reference must point at")
 	case s == "none" && allowNone:
 		return expectation{conditional: true, absent: true}, nil
 	case s == "none":
@@ -146,7 +152,7 @@ func runRefSet(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	exp, err := parseExpect(c.String("expect"), true)
+	exp, err := parseExpect(c, true)
 	if err != nil {
 		return err
 	}
@@ -176,7 +182,7 @@ func runRefRm(c *cli.Context) error {
 	if c.NArg() != 1 {
 		return fmt.Errorf("ref rm requires exactly one NAME argument, got %d", c.NArg())
 	}
-	exp, err := parseExpect(c.String("expect"), false)
+	exp, err := parseExpect(c, false)
 	if err != nil {
 		return err
 	}
@@ -236,6 +242,14 @@ func putRef(coll *gc.Collector, refs *refstore.Store, name string, root key.Key,
 		return exp.explain(name, putErr)
 	}
 	commit()
+	if exp.conditional {
+		// What was overwritten is what the store compared against, whatever
+		// the read above saw: the expected key, or nothing.
+		old = nil
+		if !exp.absent {
+			old = &exp.key
+		}
+	}
 	if old != nil {
 		return coll.ReleaseRef(*old)
 	}

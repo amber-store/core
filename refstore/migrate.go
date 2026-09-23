@@ -76,8 +76,13 @@ func migrateLegacy(dir string) error {
 		}
 	}
 	if !legacy {
-		// Debris: a Pebble-based binary tried the migrated store, created
-		// its lock file and failed on the poison marker.
+		// Debris. After a migration: a Pebble-based binary tried the store,
+		// created its lock file and failed on the poison marker, or a power
+		// loss undid part of the move; all of it goes where the rest went.
+		// Otherwise there never was a Pebble store here, only a lock file.
+		if _, err := os.Stat(filepath.Join(dir, dbFile)); err == nil {
+			return retireLegacy(dir, files)
+		}
 		if err := os.Remove(filepath.Join(dir, legacyLock)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("refstore: %w", err)
 		}
@@ -159,11 +164,9 @@ func importPebble(dir string) (err error) {
 	if err != nil {
 		return fmt.Errorf("refstore: migrating: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
+	// Unconditional, and a no-op once committed: a panic must not leave the
+	// write lock held, which would wedge every writer in every process.
+	defer tx.Rollback()
 	q := refsdb.New(tx)
 	it, err := pdb.NewIter(&pebble.IterOptions{})
 	if err != nil {
@@ -187,7 +190,22 @@ func importPebble(dir string) (err error) {
 	if err = os.Rename(tmp, filepath.Join(dir, dbFile)); err != nil {
 		return fmt.Errorf("refstore: migrating: %w", err)
 	}
-	return syncDir(dir)
+	if err = syncDir(dir); err != nil {
+		return err
+	}
+	// Poison the directory while Pebble's lock is still held (pdb closes on
+	// return): otherwise a Pebble-based binary could open the store in the
+	// gap and write references that the migration has already left behind.
+	// Not before the rename: a crash in between would leave a store this
+	// import could not open again.
+	return writePoison(dir)
+}
+
+func writePoison(dir string) error {
+	if err := os.WriteFile(filepath.Join(dir, poisonFile), nil, 0o644); err != nil {
+		return fmt.Errorf("refstore: %w", err)
+	}
+	return nil
 }
 
 // retireLegacy writes the poison marker and moves Pebble's files aside: data
@@ -195,8 +213,8 @@ func importPebble(dir string) (err error) {
 // and, until the very end, a manifest marker — in place, so the next Open
 // comes back here and finishes.
 func retireLegacy(dir string, files []string) error {
-	if err := os.WriteFile(filepath.Join(dir, poisonFile), nil, 0o644); err != nil {
-		return fmt.Errorf("refstore: %w", err)
+	if err := writePoison(dir); err != nil { // again: a resumed cleanup may predate it
+		return err
 	}
 	aside := filepath.Join(dir, legacyDir)
 	if err := os.MkdirAll(aside, 0o755); err != nil {

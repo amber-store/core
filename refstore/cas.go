@@ -65,11 +65,9 @@ func (s *Store) ifAt(name string, old key.Key, change func(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
+	// Unconditional, and a no-op once committed: a panic must not leave the
+	// write lock held, which would wedge every writer in every process.
+	defer tx.Rollback()
 	q := s.q.WithTx(tx)
 	current, err := q.GetRecord(ctx, blob([]byte(name)))
 	if errors.Is(err, sql.ErrNoRows) {

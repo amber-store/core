@@ -15,7 +15,10 @@ import (
 	"github.com/amber-store/core/refstore"
 )
 
-const childDirEnv = "REFSTORE_TEST_CHILD_DIR"
+const (
+	childDirEnv  = "REFSTORE_TEST_CHILD_DIR"
+	childNameEnv = "REFSTORE_TEST_CHILD_NAME" // set: the child only opens and puts this name
+)
 
 // TestMain doubles as the second process of
 // TestSecondProcessSharesTheStore: with childDirEnv set, the test binary
@@ -35,6 +38,12 @@ func childProcess(dir string) error {
 	s, err := refstore.Open(dir, false)
 	if err != nil {
 		return err
+	}
+	if name := os.Getenv(childNameEnv); name != "" {
+		if err := s.Put(name, []byte("v")); err != nil {
+			return err
+		}
+		return s.Close()
 	}
 	got, err := s.Get("from-parent")
 	if err != nil {
@@ -212,6 +221,11 @@ func TestConcurrentFirstOpens(t *testing.T) {
 			wg.Go(func() { stores[i], errs[i] = refstore.Open(dir, false) })
 		}
 		wg.Wait()
+		for _, s := range stores {
+			if s != nil {
+				t.Cleanup(func() { s.Close() })
+			}
+		}
 		for i, err := range errs {
 			if err != nil {
 				t.Fatalf("round %d, open %d: %v", round, i, err)
@@ -227,5 +241,32 @@ func TestConcurrentFirstOpens(t *testing.T) {
 		for _, s := range stores {
 			s.Close()
 		}
+	}
+}
+
+// The same race between real processes: each child opens the fresh store
+// and puts one record.
+func TestConcurrentFirstOpensAcrossProcesses(t *testing.T) {
+	dir := t.TempDir()
+	const n = 6
+	outs := make([][]byte, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			cmd := exec.Command(os.Args[0])
+			cmd.Env = append(os.Environ(), childDirEnv+"="+dir, fmt.Sprintf("%s=from-%d", childNameEnv, i))
+			outs[i], errs[i] = cmd.CombinedOutput()
+		})
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("child %d: %v\n%s", i, err, outs[i])
+		}
+	}
+	all, err := open(t, dir).All()
+	if err != nil || len(all) != n {
+		t.Fatalf("%d records, %v; want %d", len(all), err, n)
 	}
 }

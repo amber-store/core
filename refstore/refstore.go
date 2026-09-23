@@ -73,11 +73,9 @@ func (s *Store) PutBatch(records []Record) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
+	// Unconditional, and a no-op once committed: a panic must not leave the
+	// write lock held, which would wedge every writer in every process.
+	defer tx.Rollback()
 	q := s.q.WithTx(tx)
 	for _, r := range records {
 		if err = q.PutRecord(ctx, refsdb.PutRecordParams{Name: blob([]byte(r.Name)), Record: blob(r.Data)}); err != nil {

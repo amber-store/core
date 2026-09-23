@@ -83,13 +83,50 @@ first opens fail. Write durability follows the store's sync flag:
 `synchronous=FULL` with `fullfsync` and `checkpoint_fullfsync` on, or
 `synchronous=NORMAL` without.
 
+### Rules for implementations
+
+An implementation that shares a store with others follows these; they are
+what makes concurrent use by different programs safe.
+
+- **Fresh or foreign.** A database with application id 0, version 0 and no
+  schema objects is fresh: set the application id and apply the migrations,
+  in one transaction. Any other database whose id is not `0x616D6272` — an
+  id of 0 on a non-empty file included — is refused, and so is a negative
+  version or one newer than the implementation knows.
+- **Migrations** run inside that transaction, so a file holds no statement
+  that cannot (`VACUUM`, `PRAGMA journal_mode`) or that does nothing there
+  (`PRAGMA foreign_keys`).
+- **Writes.** Every write transaction begins with `BEGIN IMMEDIATE`. A busy
+  timeout is set on every connection before any other pragma. The switch to
+  WAL can fail busy without the timeout applying; it is retried.
+- **Optimistic forms.** The current record is read and decoded, its key
+  compared, and the record replaced or deleted, all inside one write
+  transaction. A reference that does not exist is *not found*; one that
+  points elsewhere, or exists when it must not, is a *conflict*; a current
+  record that does not decode is an error, never a match. The store retries
+  nothing.
+- **One host.** WAL shares memory between the processes that have the file
+  open, so all of them run on one host; network filesystems are out.
+- **Pebble directories.** `refs.sqlite` appears next to Pebble files only by
+  the import's atomic rename, so its presence means "imported". An
+  implementation that cannot import must refuse a directory that holds a
+  `marker.manifest.*` file and no `refs.sqlite`, and must never create an
+  empty `refs.sqlite` there: it would hide the references, and a GC run
+  would reap the objects they keep alive.
+
 **Stores written before this format** kept references in a Pebble DB in the
 same directory. The first open imports them into `refs.sqlite`, moves the
 Pebble files to `refs/pebble-migrated/` (a backup the operator may delete)
 and leaves `marker.format-version.999999.999` behind. That marker makes
 Pebble refuse the directory, so a binary that predates the change fails
 loudly instead of creating an empty store — from which a `gc run` would reap
-every object. `refs/migrate.lock` serializes concurrent first opens.
+every object. `refs/migrate.lock`, a BSD `flock(2)` lock, serializes
+concurrent first opens; a Pebble store that another process still holds open
+is not migrated, and the open fails. To go back to a Pebble-based release,
+move `pebble-migrated/*` back, delete the marker **and delete
+`refs.sqlite`**: a later upgrade imports only when that file is absent, and
+would otherwise keep the stale SQLite references and drop the newer Pebble
+ones.
 
 ## CLI
 

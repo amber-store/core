@@ -82,7 +82,7 @@ At open, inside one `BEGIN IMMEDIATE` transaction:
    application id. The id differs, or it is absent on a non-empty database:
    refuse the file, it is not a reference store.
 3. `user_version` greater than the newest embedded migration: refuse the
-   file, a newer release wrote it.
+   file, a newer release wrote it. A negative version is refused too.
 4. Apply every migration numbered above `user_version`, in order, then set
    `user_version` to the newest number and commit.
 
@@ -196,6 +196,10 @@ decides whether there is anything to do. When it exists:
    migration instead of being copied mid-flight), copy every record into
    `refs.sqlite.tmp` with full syncs and a rollback journal, close it, rename
    it to `refs.sqlite` and sync the directory. The rename is the commit point.
+   The poison marker (next step) is written right after it, while Pebble's
+   lock is still held, so that no Pebble-based binary can slip into the gap
+   and write references the import has already left behind; never before
+   it, or a crash in between would leave a store the import cannot reopen.
 3. Write the poison marker `marker.format-version.999999.999`, then move the
    Pebble files into `<dir>/pebble-migrated/`: data files first, the manifest
    markers next, `LOCK` last. A crash anywhere leaves `LOCK` (and, until the

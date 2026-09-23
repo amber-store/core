@@ -2296,3 +2296,39 @@ git commit -m "docs, ci: the SQLite reference store; sqlc in the dev shell and a
 - **Lesson.** One verification command in this plan piped `go test` into
   `tail` without `pipefail`, which let a failing race run through to a
   commit. Verification commands must not hide the exit status.
+
+## Review fixes
+
+The independent review (no critical findings) led to these changes, each with
+a test that was seen failing with the fix reversed:
+
+- **`--expect ""`** was parsed as "no expectation", so a script's unset
+  variable turned a conditional `ref set` or `ref rm` into an unconditional
+  one. `parseExpect` now looks at whether the flag was given and refuses an
+  empty value. `TestE2E_RefExpect`.
+- **Write transactions roll back unconditionally** (`defer tx.Rollback()`, a
+  no-op once committed). The conditional form left SQLite's write lock held
+  after a panic, wedging every writer in every process.
+  `TestWriteTransactionsSurviveAPanic`.
+- **A negative `user_version`** panicked on a slice bound inside the
+  transaction, and the unwinding then blocked forever with the write lock
+  held. It is refused. `TestNegativeSchemaVersionIsRefused`.
+- The loser of a race to initialize a store returns without writing.
+- The poison marker is written right after the import's rename, while
+  Pebble's lock is still held; debris left next to a finished import
+  (a stray `LOCK`, files a power loss put back) is moved aside with the rest.
+  `TestMigrationRefusesAStoreInUse`, `TestStaleTemporaryDatabaseIsReplaced`,
+  `TestLeftoverPebbleFilesAreRetired`.
+- `putRef` releases the expected key after a conditional write, as `rmRef`
+  already did.
+- `TestConcurrentFirstOpensAcrossProcesses` repeats the first-open race with
+  real processes; the concurrent-open tests no longer leak stores on failure.
+- `architecture/references.md` gained "Rules for implementations" (fresh or
+  foreign, migrations, writes, the optimistic forms' contract, one host,
+  Pebble directories) and the rollback procedure.
+
+Declined: moving the WAL switch out of the DSN so that a refused foreign
+database is not switched to WAL first. The file would have to sit at
+`refs/refs.sqlite` to be touched at all, the change is benign, and the open
+path as it stands was stress-tested by the reviewer with real processes
+(concurrent first opens, migrations, 6400 open/put/close cycles).

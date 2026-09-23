@@ -15,7 +15,9 @@ import (
 
 // A migration is one released schema step. Files are named
 // NNNN_description.sql, numbered contiguously from 0001, hold plain SQL (one
-// or more statements) and never change once released. PRAGMA user_version
+// or more statements) and never change once released. They run inside a
+// transaction, so statements that cannot (VACUUM, PRAGMA journal_mode) or
+// that do nothing there (PRAGMA foreign_keys) do not belong in one. PRAGMA user_version
 // records how many have been applied; there is no other bookkeeping, so other
 // implementations can run the same files by the same rule.
 type migration struct {
@@ -108,13 +110,14 @@ func migrateSchema(ctx context.Context, conn *sql.Conn, set []migration) (err er
 	if err != nil {
 		return fmt.Errorf("refstore: schema: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			tx.Rollback()
-		}
-	}()
+	// Unconditional, and a no-op once committed: a panic must not leave the
+	// write lock held, which would wedge every writer in every process.
+	defer tx.Rollback()
 	if st, err = readSchemaState(ctx, tx); err != nil {
 		return err
+	}
+	if st.appID == applicationID && st.version == latest {
+		return nil // another process got here first
 	}
 	switch {
 	case st.appID == 0 && st.version == 0 && st.objects == 0: // a fresh database
@@ -123,6 +126,9 @@ func migrateSchema(ctx context.Context, conn *sql.Conn, set []migration) (err er
 		}
 	case st.appID != applicationID:
 		return fmt.Errorf("refstore: not a reference store: application_id is %#x, want %#x", st.appID, applicationID)
+	}
+	if st.version < 0 {
+		return fmt.Errorf("refstore: schema version %d is not a version", st.version)
 	}
 	if st.version > latest {
 		return fmt.Errorf("refstore: schema version %d is newer than this release understands (%d)", st.version, latest)

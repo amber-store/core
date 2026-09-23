@@ -64,7 +64,9 @@ store:
 The packages compose loosely; consumers wire them together and own their
 store-directory layout. The conventional layout (which the CLI uses) is
 `<dir>/packstore` for objects and `<dir>/refs` for references. A store
-directory is **single-owner**: never open one from two live processes.
+directory is **single-owner**: never open one from two live processes. The
+object store enforces that with an exclusive lock; the reference database on
+its own is safe to share between processes.
 
 | Package | Role |
 |---------|------|

@@ -435,6 +435,11 @@ func TestE2E_RefExpect(t *testing.T) {
 		t.Fatal("a misplaced --expect was accepted")
 	}
 	wantAt(root1)
+	// An empty expectation, a script's unset variable, must fail as well.
+	if _, err := ref("set", "--expect", "", "r", root2); err == nil {
+		t.Fatal("an empty --expect was accepted by ref set")
+	}
+	wantAt(root1)
 	if _, err := ref("set", "--expect", root1, "r", root2); err != nil {
 		t.Fatalf("set with the right --expect: %v", err)
 	}
@@ -443,6 +448,10 @@ func TestE2E_RefExpect(t *testing.T) {
 	if _, err := ref("rm", "--expect", "none", "r"); err == nil {
 		t.Fatal("ref rm accepted --expect none")
 	}
+	if _, err := ref("rm", "--expect", "", "r"); err == nil {
+		t.Fatal("an empty --expect was accepted by ref rm")
+	}
+	wantAt(root2)
 	if _, err := ref("rm", "--expect", root1, "r"); err == nil {
 		t.Fatal("a stale --expect deleted the reference")
 	}

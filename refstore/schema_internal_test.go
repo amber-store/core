@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 func TestEmbeddedMigrationsAreContiguous(t *testing.T) {
@@ -126,5 +127,37 @@ func TestNewerSchemaIsRefused(t *testing.T) {
 	}
 	if _, err := Open(dir, false); err == nil || !strings.Contains(err.Error(), "newer") {
 		t.Fatalf("Open(schema version 2) = %v, want a newer-version error", err)
+	}
+}
+
+// A negative version used to panic inside the write transaction, and the
+// unwinding then blocked forever with the write lock held.
+func TestNegativeSchemaVersionIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("PRAGMA user_version = -1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		s, err := Open(dir, false)
+		if err == nil {
+			s.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a version") {
+			t.Fatalf("Open(schema version -1) = %v, want it refused", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Open hangs on a negative schema version")
 	}
 }
