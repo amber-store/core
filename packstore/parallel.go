@@ -124,7 +124,7 @@ func (s *Store) runWriter(ctx context.Context, ch <-chan Object, seen *seenSet, 
 				deduped.Add(1)
 				continue
 			}
-			has, err := s.Has(obj.Key)
+			has, err := s.hasLocal(obj.Key)
 			if err != nil {
 				return err
 			}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"iter"
 	"os"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -72,12 +71,14 @@ type activeSegment struct {
 }
 
 // Store is an on-disk content-addressable store over segment files. It is
-// safe for concurrent use. Lock ordering: appendMu before mu, never the
-// reverse. appendMu serializes the write path (append, fsync, seal, Close);
-// mu guards sealed/active/closed for readers.
+// safe for concurrent use, by goroutines and — several stores on one
+// directory — by processes (active.go, view.go). Lock ordering: appendMu,
+// then refreshMu, then mu, never the reverse. appendMu serializes the write
+// path (append, fsync, seal, Close); refreshMu serializes refreshes of the
+// view; mu guards sealed/active/foreign/closed for readers.
 type Store struct {
 	dir  string
-	dirF *os.File // holds the flock; also used for directory fsyncs
+	dirF *os.File // holds the shared directory flock; also used for directory fsyncs
 	cfg  config
 
 	appendMu sync.Mutex
@@ -87,12 +88,16 @@ type Store struct {
 	greyMu    sync.Mutex
 	grey      map[key.Key]struct{}
 
-	mu     sync.RWMutex
-	sealed []*sealedSegment // ascending id; newest last
-	active *activeSegment   // nil until the first write of a session
-	nextID uint64
-	closed bool
-	failed error // sticky write-path failure; written under appendMu+mu, read under either
+	mu      sync.RWMutex
+	sealed  []*sealedSegment // ascending id
+	active  *activeSegment   // the segment this store owns; nil until its first write
+	foreign []*foreignActive // active segments it does not own, indexed for reading
+	// structEpoch counts the changes this store itself made to the view, so
+	// that a refresh that raced one only adds (view.go). Guarded by mu.
+	structEpoch uint64
+	nextID      uint64 // a floor for new segment ids; under appendMu
+	closed      bool
+	failed      error // sticky write-path failure; written under appendMu+mu, read under either
 
 	// scrubMu/scrubN/scrubC track in-flight lock-free mmap walks (Verify,
 	// ScanIndex, Record): Close/Wipe/Remove wait for scrubN to reach 0 before
@@ -112,6 +117,12 @@ type Store struct {
 	writes   map[*writeToken]time.Time // in-flight Put/WriteBatch/WriteParallel starts
 
 	fsyncs atomic.Int64 // active-segment fsyncs issued, for tests
+
+	// refreshSeq counts refreshes of the view, so that a lookup that waited
+	// for one does not repeat it; refreshes counts them for tests.
+	refreshMu  sync.Mutex
+	refreshSeq atomic.Uint64
+	refreshes  atomic.Int64
 }
 
 // beginScrub registers a lock-free mmap walk. Call while holding mu.RLock
@@ -148,10 +159,16 @@ func (s *Store) waitScrubs() {
 	s.scrubMu.Unlock()
 }
 
-// Open opens (creating if necessary) a store rooted at dir. Only one Store
-// may have a given dir open at a time (flock on the directory). Sealed
-// segments are mmap'd and validated; the active segment, if any, is
-// tail-scanned and truncated to its last valid record.
+// Open opens (creating if necessary) a store rooted at dir. Any number of
+// stores, in any number of processes, may have a directory open at once.
+// Opening locks no segment and modifies none: sealed segments are mmap'd and
+// validated, active ones indexed from their sidecars for reading. The store
+// takes an active segment of its own at its first write (active.go).
+//
+// The directory is flocked shared for the store's life. Releases from before
+// stores could share a directory take that lock exclusively and assume they
+// own the one active segment; this keeps them out, and keeps this store out
+// while one of them is in.
 func Open(dir string, opts ...Option) (*Store, error) {
 	cfg := defaultConfig()
 	for _, o := range opts {
@@ -164,13 +181,16 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := unix.Flock(int(dirF.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+	if err := unix.Flock(int(dirF.Fd()), unix.LOCK_SH|unix.LOCK_NB); err != nil {
 		dirF.Close()
-		return nil, fmt.Errorf("packstore: %s is already open: %w", dir, err)
+		return nil, fmt.Errorf("packstore: %s is held by an older release, which needs the store to itself: %w", dir, err)
 	}
 	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1, writes: make(map[*writeToken]time.Time)}
 	s.scrubC = sync.NewCond(&s.scrubMu)
-	if err := s.load(); err != nil {
+	if ls, err := listSegments(dir); err == nil {
+		removeOrphanSidecars(dir, ls)
+	}
+	if err := s.refreshLocked(true); err != nil {
 		s.releaseDir()
 		return nil, err
 	}
@@ -181,57 +201,10 @@ func (s *Store) releaseDir() {
 	for _, seg := range s.sealed {
 		seg.close()
 	}
+	for _, fa := range s.foreign {
+		fa.f.Close()
+	}
 	s.dirF.Close() // releases the flock
-}
-
-// load scans the directory: sealed segments are opened and validated, the
-// active segment (at most one) is recovered.
-func (s *Store) load() error {
-	entries, err := os.ReadDir(s.dir)
-	if err != nil {
-		return err
-	}
-	var activePaths, sidecarNames []string
-	for _, e := range entries {
-		name := e.Name()
-		switch {
-		case strings.HasSuffix(name, activeSuffix+sidecarSuffix):
-			sidecarNames = append(sidecarNames, name)
-		case strings.HasSuffix(name, activeSuffix):
-			activePaths = append(activePaths, name)
-		case strings.HasSuffix(name, sealedSuffix):
-			id, err := parseSegmentID(name, sealedSuffix)
-			if err != nil {
-				return err
-			}
-			seg, err := openSealed(filepath.Join(s.dir, name), id)
-			if err != nil {
-				return err
-			}
-			s.sealed = append(s.sealed, seg)
-			if id >= s.nextID {
-				s.nextID = id + 1
-			}
-		}
-		// Anything else (e.g. .DS_Store) is ignored.
-	}
-	slices.SortFunc(s.sealed, func(a, b *sealedSegment) int { return cmp.Compare(a.id, b.id) })
-
-	for _, name := range sidecarNames {
-		if !slices.Contains(activePaths, strings.TrimSuffix(name, sidecarSuffix)) {
-			// The index of a segment that was sealed or wiped: a crash fell
-			// between the segment's rename or removal and the index's.
-			os.Remove(filepath.Join(s.dir, name))
-		}
-	}
-
-	if len(activePaths) > 1 {
-		return fmt.Errorf("%w: %d active segments, want at most one: %v", ErrCorrupt, len(activePaths), activePaths)
-	}
-	if len(activePaths) == 0 {
-		return nil
-	}
-	return s.recoverActive(activePaths[0])
 }
 
 func parseSegmentID(name, suffix string) (uint64, error) {
@@ -241,100 +214,6 @@ func parseSegmentID(name, suffix string) (uint64, error) {
 		return 0, fmt.Errorf("%w: bad segment file name %q", ErrCorrupt, name)
 	}
 	return id, nil
-}
-
-// recoverActive tail-scans name, then either completes a crashed seal-rename
-// or truncates the file to its valid prefix and resumes it as the active
-// segment.
-func (s *Store) recoverActive(name string) error {
-	id, err := parseSegmentID(name, activeSuffix)
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(s.dir, name)
-	res, err := recoverSegment(path)
-	if err != nil {
-		return err
-	}
-	if id >= s.nextID {
-		s.nextID = id + 1
-	}
-	if res.sealed {
-		// Crash between footer-write and rename: complete the rename.
-		sealedPath := strings.TrimSuffix(path, ".active")
-		if err := os.Rename(path, sealedPath); err != nil {
-			return err
-		}
-		if err := s.dirF.Sync(); err != nil {
-			return err
-		}
-		os.Remove(path + sidecarSuffix) // a sealed segment indexes itself
-		seg, err := openSealed(sealedPath, id)
-		if err != nil {
-			return err
-		}
-		s.sealed = append(s.sealed, seg)
-		slices.SortFunc(s.sealed, func(a, b *sealedSegment) int { return cmp.Compare(a.id, b.id) })
-		return nil
-	}
-
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return err
-	}
-	size := res.dataEnd
-	if size < int64(len(magicHeader)) {
-		res.sidecarEnd, res.missing = 0, nil
-		// Header never became durable: reset to a fresh header.
-		// This is deliberate and silent; nothing acknowledged is lost.
-		if err := f.Truncate(0); err != nil {
-			f.Close()
-			return err
-		}
-		if _, err := f.WriteAt(magicHeader, 0); err != nil {
-			f.Close()
-			return err
-		}
-		size = int64(len(magicHeader))
-	} else {
-		if err := f.Truncate(size); err != nil {
-			f.Close()
-			return err
-		}
-	}
-	s.active = &activeSegment{id: id, path: path, f: f, size: size, index: res.index, sc: openOwnedSidecar(path, res)}
-	return nil
-}
-
-// createActive opens the next-numbered active segment. Called under appendMu.
-func (s *Store) createActive() error {
-	id := s.nextID
-	s.nextID++
-	path := filepath.Join(s.dir, fmt.Sprintf("%016x%s", id, activeSuffix))
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return err
-	}
-	fail := func(err error) error {
-		f.Close()
-		os.Remove(path) // never leave a second .seg.active to brick the next Open
-		return err
-	}
-	if _, err := f.WriteAt(magicHeader, 0); err != nil {
-		return fail(err)
-	}
-	if err := f.Sync(); err != nil {
-		return fail(err)
-	}
-	if err := s.dirF.Sync(); err != nil {
-		return fail(err)
-	}
-	sc, _ := createSidecar(path + sidecarSuffix) // nil on failure: a segment works without one
-	a := &activeSegment{id: id, path: path, f: f, size: int64(len(magicHeader)), index: make(map[key.Key]activeLoc), sc: sc}
-	s.mu.Lock()
-	s.active = a
-	s.mu.Unlock()
-	return nil
 }
 
 // append writes one encoded record to the active segment (creating it if
@@ -357,10 +236,8 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	if s.failed != nil {
 		return s.failed
 	}
-	if s.active == nil {
-		if err := s.createActive(); err != nil {
-			return err
-		}
+	if err := s.ensureActiveLocked(); err != nil {
+		return err
 	}
 	a := s.active
 	if _, ok := a.index[k]; ok {
@@ -482,7 +359,7 @@ func (s *Store) sealActiveLocked() error {
 		return err
 	}
 	s.mu.Lock()
-	s.sealed = append(s.sealed, seg)
+	s.publishSealedLocked(seg)
 	s.active = nil
 	s.mu.Unlock()
 	// Close the fd only after the swap: in-flight readers hold mu.RLock for
@@ -521,7 +398,7 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 		}
 		seen[obj.Key] = struct{}{}
 		s.observe(obj.Key)
-		has, err := s.Has(obj.Key)
+		has, err := s.hasLocal(obj.Key)
 		if err != nil {
 			return fail(fmt.Errorf("exists (%s): %w", obj.Key, err))
 		}
@@ -553,7 +430,7 @@ func (s *Store) Put(k key.Key, data []byte) error {
 		return failed
 	}
 	s.observe(k)
-	has, err := s.Has(k)
+	has, err := s.hasLocal(k)
 	if err != nil {
 		return err
 	}
@@ -567,22 +444,67 @@ func (s *Store) Put(k key.Key, data []byte) error {
 	return s.append(k, rec, true)
 }
 
+// activeLookupLocked finds k in the active segment this store owns (own) or
+// in one it only reads (fa). The caller holds mu.
+func (s *Store) activeLookupLocked(k key.Key) (own *activeSegment, fa *foreignActive, loc activeLoc, ok bool) {
+	if s.active != nil {
+		if loc, ok := s.active.index[k]; ok {
+			return s.active, nil, loc, true
+		}
+	}
+	for _, fa := range s.foreign {
+		if loc, ok := fa.scan.index[k]; ok {
+			return nil, fa, loc, true
+		}
+	}
+	return nil, nil, activeLoc{}, false
+}
+
+// lookup runs find and, if it found nothing, once more after a fresh look at
+// the directory: another store may have written k since this one last looked.
+func lookup[T any](s *Store, k key.Key, find func() (T, error)) (T, error) {
+	v, err := find()
+	stale := errors.Is(err, errStaleView)
+	if stale || errors.Is(err, ErrNotFound) {
+		if rerr := s.refreshAfterMiss(stale); rerr != nil {
+			var zero T
+			return zero, rerr
+		}
+		v, err = find()
+	}
+	if errors.Is(err, errStaleView) {
+		var zero T
+		return zero, fmt.Errorf("%w: %s: another writer's active segment does not hold the record its index names", ErrCorrupt, k)
+	}
+	return v, err
+}
+
 // Get returns the bytes stored under k, or ErrNotFound if k is absent. The
 // returned slice is caller-owned.
 func (s *Store) Get(k key.Key) ([]byte, error) {
+	return lookup(s, k, func() ([]byte, error) { return s.get(k) })
+}
+
+func (s *Store) get(k key.Key) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return nil, ErrClosed
 	}
-	if s.active != nil {
-		if loc, ok := s.active.index[k]; ok {
-			stored := make([]byte, loc.slen)
-			if _, err := s.active.f.ReadAt(stored, loc.off+amberpack.RecHeaderSize); err != nil {
+	if own, fa, loc, ok := s.activeLookupLocked(k); ok {
+		var stored []byte
+		if fa != nil {
+			var err error
+			if stored, err = fa.read(k, loc); err != nil {
 				return nil, err
 			}
-			return amberpack.DecodePayload(loc.flags, loc.ulen, stored)
+		} else {
+			stored = make([]byte, loc.slen)
+			if _, err := own.f.ReadAt(stored, loc.off+amberpack.RecHeaderSize); err != nil {
+				return nil, err
+			}
 		}
+		return amberpack.DecodePayload(loc.flags, loc.ulen, stored)
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
 		data, found, err := s.sealed[i].get(k)
@@ -605,19 +527,24 @@ func (s *Store) Get(k key.Key) ([]byte, error) {
 // it to amberpack.Writer.AddRecord without decompressing and re-encoding. Like
 // Get, it does not CRC-check; the receiving Reader validates framing and CRC.
 func (s *Store) GetRecord(k key.Key) ([]byte, error) {
+	return lookup(s, k, func() ([]byte, error) { return s.getRecord(k) })
+}
+
+func (s *Store) getRecord(k key.Key) ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return nil, ErrClosed
 	}
-	if s.active != nil {
-		if loc, ok := s.active.index[k]; ok {
-			rec := make([]byte, amberpack.RecHeaderSize+int(loc.slen))
-			if _, err := s.active.f.ReadAt(rec, loc.off); err != nil {
-				return nil, err
-			}
-			return rec, nil
+	if own, fa, loc, ok := s.activeLookupLocked(k); ok {
+		if fa != nil {
+			return fa.readRecord(k, loc)
 		}
+		rec := make([]byte, amberpack.RecHeaderSize+int(loc.slen))
+		if _, err := own.f.ReadAt(rec, loc.off); err != nil {
+			return nil, err
+		}
+		return rec, nil
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
 		rec, found, err := s.sealed[i].getRecord(k)
@@ -636,15 +563,24 @@ func (s *Store) GetRecord(k key.Key) ([]byte, error) {
 // It sizes objects for byte-balanced push batching against the bytes that
 // actually travel.
 func (s *Store) StoredSize(k key.Key) (uint64, bool, error) {
+	n, ok, err := s.storedSize(k)
+	if err == nil && !ok {
+		if err := s.refreshAfterMiss(false); err != nil {
+			return 0, false, err
+		}
+		n, ok, err = s.storedSize(k)
+	}
+	return n, ok, err
+}
+
+func (s *Store) storedSize(k key.Key) (uint64, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return 0, false, ErrClosed
 	}
-	if s.active != nil {
-		if loc, ok := s.active.index[k]; ok {
-			return uint64(loc.slen), true, nil
-		}
+	if _, _, loc, ok := s.activeLookupLocked(k); ok {
+		return uint64(loc.slen), true, nil
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
 		if slen, ok := s.sealed[i].storedSize(k); ok {
@@ -657,10 +593,11 @@ func (s *Store) StoredSize(k key.Key) (uint64, bool, error) {
 // locateLocked returns the segment id and record offset where k lives, for
 // ordering reads by physical layout. The caller must hold s.mu (read or write).
 func (s *Store) locateLocked(k key.Key) (seg, off uint64, ok bool) {
-	if s.active != nil {
-		if loc, ok := s.active.index[k]; ok {
-			return s.active.id, uint64(loc.off), true
+	if own, fa, loc, ok := s.activeLookupLocked(k); ok {
+		if fa != nil {
+			return fa.id, uint64(loc.off), true
 		}
+		return own.id, uint64(loc.off), true
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
 		if o, found := s.sealed[i].locate(k); found {
@@ -713,15 +650,29 @@ func (s *Store) SortByLocation(keys []key.Key) {
 
 // Has reports whether an object is stored under k.
 func (s *Store) Has(k key.Key) (bool, error) {
+	has, err := s.hasLocal(k)
+	if err == nil && !has {
+		if err := s.refreshAfterMiss(false); err != nil {
+			return false, err
+		}
+		has, err = s.hasLocal(k)
+	}
+	return has, err
+}
+
+// hasLocal is Has without the second look: what this store's view holds. The
+// write path checks for duplicates with it. A duplicate it fails to see —
+// written by another store a moment ago — costs a redundant record, which
+// compaction folds; listing the directory for every new object would cost
+// every ingest dearly.
+func (s *Store) hasLocal(k key.Key) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
 		return false, ErrClosed
 	}
-	if s.active != nil {
-		if _, ok := s.active.index[k]; ok {
-			return true, nil
-		}
+	if _, _, _, ok := s.activeLookupLocked(k); ok {
+		return true, nil
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
 		if s.sealed[i].has(k) {
@@ -731,15 +682,33 @@ func (s *Store) Has(k key.Key) (bool, error) {
 	return false, nil
 }
 
-// Wipe deletes every object: the active segment and all sealed segments are
-// closed and their files removed, leaving an empty, still-open store (the
-// store-wipe operation). Readers are drained via the write lock before
-// segments are detached; in-flight Verify walks are waited out before
-// unmapping, exactly like Close. nextID stays monotonic so segment names
-// never repeat within a session.
+// Wipe deletes every object: every segment, sealed or active, is closed and
+// its file removed, leaving an empty, still-open store (the store-wipe
+// operation). It refuses, deleting nothing, while another store owns an
+// active segment: that writer would go on appending to a file that is gone.
+// Readers are drained via the write lock before segments are detached;
+// in-flight Verify walks are waited out before unmapping, exactly like Close.
 func (s *Store) Wipe() error {
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
+	s.refreshMu.Lock() // held throughout: the view must not grow behind the locks taken below
+	defer s.refreshMu.Unlock()
+	if err := s.refreshLocked(false); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	foreign := slices.Clone(s.foreign)
+	s.mu.RUnlock()
+	held, err := s.lockForeign(foreign)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, f := range held {
+			f.Close()
+		}
+	}()
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -747,8 +716,8 @@ func (s *Store) Wipe() error {
 	}
 	active := s.active
 	sealed := s.sealed
-	s.active = nil
-	s.sealed = nil
+	s.active, s.sealed, s.foreign = nil, nil, nil
+	s.structEpoch++
 	// A sticky write-path failure (setFailed after a bad fsync) poisons the
 	// data the fsync may have torn — data the wipe is about to destroy. The
 	// reset clears it: the reopened-empty store must accept writes again.
@@ -762,36 +731,35 @@ func (s *Store) Wipe() error {
 	s.waitScrubs()
 
 	var firstErr error
+	note := func(err error) {
+		if err != nil && !os.IsNotExist(err) && firstErr == nil {
+			firstErr = err
+		}
+	}
 	if active != nil {
-		if err := active.f.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if err := os.Remove(active.path); err != nil && firstErr == nil {
-			firstErr = err
-		}
 		active.sc.close()
-		if err := os.Remove(active.path + sidecarSuffix); err != nil && !os.IsNotExist(err) && firstErr == nil {
-			firstErr = err
-		}
+		note(active.f.Close())
+		note(os.Remove(active.path))
+		note(os.Remove(active.path + sidecarSuffix))
+	}
+	for _, fa := range foreign {
+		fa.f.Close()
+		note(os.Remove(fa.path))
+		note(os.Remove(fa.path + sidecarSuffix))
 	}
 	for _, seg := range sealed {
-		if err := seg.close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if err := os.Remove(seg.path); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		note(seg.close())
+		note(os.Remove(seg.path))
 	}
 	if s.cfg.sync {
-		if err := s.dirF.Sync(); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		note(s.dirF.Sync())
 	}
 	return firstErr
 }
 
-// Close fsyncs and closes the active segment (without sealing it), unmaps all
-// sealed segments, and releases the directory lock.
+// Close fsyncs and closes the active segment this store owns (without sealing
+// it, so that the next writer goes on filling it), unmaps all sealed
+// segments, and releases the segment and directory locks.
 func (s *Store) Close() error {
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
@@ -813,11 +781,13 @@ func (s *Store) Close() error {
 			s.active.sc.synced(s.active.size)
 		}
 		s.active.sc.close()
-		if err := s.active.f.Close(); err != nil && firstErr == nil {
+		if err := s.active.f.Close(); err != nil && firstErr == nil { // releases the segment
 			firstErr = err
 		}
 		s.active = nil
 	}
+	foreign := s.foreign
+	s.foreign = nil
 	// Wait for in-flight Verify walks before unmapping: the scrub reads the
 	// mmaps lock-free, and munmap under it is an uncatchable SIGSEGV. New
 	// scrubs cannot start (closed is set; Verify checks it under mu.RLock).
@@ -825,6 +795,9 @@ func (s *Store) Close() error {
 	s.mu.Unlock()
 	s.waitScrubs()
 
+	for _, fa := range foreign {
+		fa.f.Close()
+	}
 	for _, seg := range s.sealed {
 		if err := seg.close(); err != nil && firstErr == nil {
 			firstErr = err

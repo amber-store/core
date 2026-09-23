@@ -316,26 +316,6 @@ func TestReopenTruncatesCorruptTail(t *testing.T) {
 	}
 }
 
-func TestSecondOpenFails(t *testing.T) {
-	dir := t.TempDir()
-	_ = openStore(t, dir)
-	if _, err := Open(dir); err == nil {
-		t.Fatal("second Open must fail while the first holds the flock")
-	}
-}
-
-func TestMultipleActiveFilesFailOpen(t *testing.T) {
-	dir := t.TempDir()
-	for _, name := range []string{"0000000000000001.seg.active", "0000000000000002.seg.active"} {
-		if err := os.WriteFile(filepath.Join(dir, name), magicHeader, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := Open(dir); err == nil {
-		t.Fatal("want error for two active segments")
-	}
-}
-
 func TestClosedStoreErrors(t *testing.T) {
 	s := openStore(t, t.TempDir())
 	o := blobObj(t, []byte("x"))
@@ -507,7 +487,9 @@ func TestCrashBetweenFooterAndRename(t *testing.T) {
 	}
 	f.Close()
 
-	// Open must complete the rename and serve everything from the sealed file.
+	// Opening serves everything from the file as it is: a store that only
+	// reads finishes nobody's seal. Its first write takes the segment,
+	// completes the rename, and goes to a new active segment.
 	s2 := openStore(t, dir)
 	for _, o := range objs {
 		data, err := s2.Get(o.Key)
@@ -515,10 +497,20 @@ func TestCrashBetweenFooterAndRename(t *testing.T) {
 			t.Fatalf("Get(%s): %v", o.Key, err)
 		}
 	}
+	extra := blobObj(t, []byte("the write that takes the segment"))
+	if err := s2.Put(extra.Key, extra.Data); err != nil {
+		t.Fatal(err)
+	}
 	segs, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
 	actives, _ = filepath.Glob(filepath.Join(dir, "*.seg.active"))
-	if len(segs) != 1 || len(actives) != 0 {
+	if len(segs) != 1 || len(actives) != 1 {
 		t.Fatalf("segs=%v actives=%v", segs, actives)
+	}
+	for _, o := range append(objs, extra) {
+		data, err := s2.Get(o.Key)
+		if err != nil || !bytes.Equal(data, o.Data) {
+			t.Fatalf("Get(%s) after the seal was finished: %v", o.Key, err)
+		}
 	}
 }
 

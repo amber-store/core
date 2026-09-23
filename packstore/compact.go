@@ -114,6 +114,13 @@ func (s *Store) Liveness(live func(key.Key) bool) ([]SegmentLiveness, error) {
 		}
 		report = append(report, info)
 	}
+	for _, fa := range s.foreign { // other writers' active segments: never victims either
+		info := SegmentLiveness{ID: fa.id}
+		for k, loc := range fa.scan.index {
+			info.add(live(k), loc.slen)
+		}
+		report = append(report, info)
+	}
 	return report, nil
 }
 
@@ -209,10 +216,8 @@ func (s *Store) copyLive(victims []*sealedSegment, live func(key.Key) bool, pace
 	survivorHas := func(k key.Key) bool {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
-		if s.active != nil {
-			if _, ok := s.active.index[k]; ok {
-				return true
-			}
+		if _, _, _, ok := s.activeLookupLocked(k); ok {
+			return true
 		}
 		for _, g := range s.sealed {
 			if !victimID[g.id] && g.has(k) {

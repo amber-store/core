@@ -153,10 +153,8 @@ func (s *Store) HasOutside(id uint64, k key.Key) (bool, error) {
 	if s.closed {
 		return false, ErrClosed
 	}
-	if s.active != nil {
-		if _, ok := s.active.index[k]; ok {
-			return true, nil
-		}
+	if _, _, _, ok := s.activeLookupLocked(k); ok {
+		return true, nil
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
 		if s.sealed[i].id == id {

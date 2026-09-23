@@ -180,7 +180,10 @@ func TestAcknowledgedRecordMissingFromIndexIsFound(t *testing.T) {
 	}
 
 	s2 := openStore(t, dir)
-	wantObjects(t, s2, objs)
+	wantObjects(t, s2, objs) // found by a store that only reads, which repairs nothing
+	// The next writer takes the segment and brings its sidecar in line.
+	extra := testObjects(t, 4)[3:]
+	putAll(t, s2, extra)
 	if err := s2.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -191,8 +194,8 @@ func TestAcknowledgedRecordMissingFromIndexIsFound(t *testing.T) {
 			listed++
 		}
 	}
-	if listed != len(objs) {
-		t.Fatalf("the sidecar lists %d records after recovery, want %d", listed, len(objs))
+	if listed != len(objs)+len(extra) {
+		t.Fatalf("the sidecar lists %d records after recovery, want %d", listed, len(objs)+len(extra))
 	}
 }
 
@@ -289,6 +292,9 @@ func TestSidecarProblemsFallBackToAFullScan(t *testing.T) {
 
 			s2 := openStore(t, dir)
 			wantObjects(t, s2, objs)
+			// The writer that takes the segment rebuilds its sidecar.
+			extra := testObjects(t, 5)[4:]
+			putAll(t, s2, extra)
 			if err := s2.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -299,8 +305,8 @@ func TestSidecarProblemsFallBackToAFullScan(t *testing.T) {
 					listed++
 				}
 			}
-			if listed != len(objs) {
-				t.Fatalf("the rebuilt sidecar lists %d records, want %d", listed, len(objs))
+			if listed != len(objs)+len(extra) {
+				t.Fatalf("the rebuilt sidecar lists %d records, want %d", listed, len(objs)+len(extra))
 			}
 		})
 	}
@@ -356,8 +362,12 @@ func TestCrashedSealLeavesNoSidecar(t *testing.T) {
 
 	s2 := openStore(t, dir)
 	wantObjects(t, s2, objs)
-	if got := sidecars(t, dir); len(got) != 0 {
-		t.Fatalf("the completed seal left its sidecar: %v", got)
+	putAll(t, s2, testObjects(t, 7)[6:]) // the write that takes the segment and finishes its seal
+	if _, err := os.Stat(data + sidecarSuffix); !os.IsNotExist(err) {
+		t.Fatalf("the completed seal left its sidecar: %v", err)
+	}
+	if got := sidecars(t, dir); len(got) != 1 {
+		t.Fatalf("sidecars = %v, want only the new active segment's", got)
 	}
 }
 

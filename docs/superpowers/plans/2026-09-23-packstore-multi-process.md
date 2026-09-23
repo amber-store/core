@@ -256,3 +256,51 @@ func (s *Store) BeginSweep(ctx context.Context) (done func(), err error)
 - `README.md` package table and the store-layout paragraph; `CLAUDE.md`: open cost before and after, and the multi-process note under Benchmarks.
 - [ ] Full verification with exit status preserved: `go test ./...`, `go test -race ./packstore ./refstore ./gc`, `go vet ./...`, `gofmt -l .`, `go test ./cmd/amber-bench`.
 - [ ] Commit `docs: the packstore's on-disk layout and multi-process protocol`.
+
+---
+
+## Amendments during execution
+
+### Task 2 and 3: recovery belongs to the owner, so it moved out of `Open`
+
+Task 2 repaired an active segment at `Open`. Task 3 makes `Open` lock and
+modify nothing, so truncating a torn tail, finishing a crashed seal and
+bringing a sidecar in line now happen when a writer **adopts** the segment. A
+store that only reads serves the segment as it finds it: a crashed seal is
+mapped as the sealed segment it is, under its active name. Four tests that
+asserted the repair right after `Open` now write first; one of them predates
+this work, `TestCrashBetweenFooterAndRename`, which also expects one active
+segment afterwards (the write that finished the seal needed somewhere to go).
+
+### Task 3
+
+- **Segment identity is (id, file), not id.** A repair replaces a sealed
+  segment under its name, and an id can come back once compaction removed the
+  highest segment. Views compare `os.SameFile` against the listing and remap.
+- **Creating a segment.** The id is claimed by creating
+  `<id>.seg.active.tmp` exclusively; the file is locked, the final names are
+  checked (the temporary name is free again once its creator renamed it, so
+  holding it proves nothing), the header is written and synced, and only then
+  is it renamed to the name adopters look for. Nobody ever sees a segment that
+  is not ready and owned. A later creator removes unlocked leftovers.
+- **Reads from another writer's segment check the record.** The key and
+  stored length at the indexed offset must match; otherwise the view is
+  rebuilt and, failing again, the read returns `ErrCorrupt` rather than
+  another object's bytes. `TestForeignReadNeverReturnsTheWrongRecord`.
+- **A refresh that raced this store's own seal, adoption or repair only
+  adds.** Such changes bump `structEpoch`; the listing predates them, so
+  dropping is left to the next refresh.
+- **`Missing` refreshes once, up front**, because misses are what it expects.
+  **`SortByLocation` does not refresh**: it is an ordering hint, and the reads
+  that follow refresh for themselves.
+- **`PutVerified`** walks a snapshot of the sealed segments registered as a
+  scrub (a refresh can now retire a mapping without `appendMu`), takes it
+  again after it sealed the active segment, and replaces a repaired segment
+  by identity rather than by position. It leaves other writers' active
+  segments alone: a damaged copy there is repaired once the segment is sealed.
+- **`Wipe` refuses while another store owns an active segment**, deleting
+  nothing: that writer would go on appending to a file that is gone.
+- The scan of an active segment became incremental (`segmentScan.advance`), so
+  that a reader's view follows a live writer by reading only what was
+  appended. The sidecar is read before the data's length, since a record is
+  written before its entry.
