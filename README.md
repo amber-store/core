@@ -48,7 +48,7 @@ store:
 | `DirLeaf`  | A run of complete directory entries (prolly-tree leaf).     |
 | `DirNode`  | Directory index node (directory tree).                      |
 | `XattrSet` | Spilled extended attributes, when too large to inline.      |
-| `Commit`   | Snapshot record: a tree, parent commits, author, committer, message. |
+| `Commit`   | Snapshot record: a tree (or the sides of a conflict), parent commits, author, committer, message, change id. |
 
 ## Encoding
 
@@ -73,8 +73,8 @@ one host, on a local filesystem.
 | Package | Role |
 |---------|------|
 | `key` | The 32-byte content key: type, length, truncated BLAKE3 hash. |
-| `fstree` | Tree objects (encode/decode), bottom-up builders, and the read paths: entry lookup, ordered listing, content streaming, reachable-set walks, completeness checks. |
-| `commit` | The commit record: canonical CBOR encoding and validation; signature fields carried opaquely. |
+| `fstree` | Tree objects (encode/decode), bottom-up builders, and the read paths: entry lookup, ordered listing, content streaming, reachable-set walks, completeness checks. A commit key reads as its tree, as a root and as the content key of a directory entry. |
+| `commit` | The commit record: canonical CBOR encoding and validation; a change id and conflicted trees for jj; signature fields carried opaquely. |
 | `chunkers` | Content-defined byte chunking (ultracdc) and item chunking for tree nodes. |
 | `ingest` | Build a tree from a local directory (or single file): `Objects` streams every built object plus the resolved root; `Dir` writes straight into a packstore; `Scan` sizes progress displays. Honors `.amberignore`; `Opts.Exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |
@@ -122,12 +122,13 @@ amber-store --store ./store ref set NAME KEY            # name an existing key
 amber-store --store ./store ref set --expect OLD NAME KEY  # move NAME only if it still points at OLD ('none': only create)
 amber-store --store ./store ref get NAME                # print the key a name points at
 amber-store --store ./store ref rm NAME                 # delete the name; objects stay
-amber-store --store ./store commit create --ref main --author 'Ann <ann@example.com>' -m 'first' KEY  # record a tree; --parent KEY|ref:NAME links history
+amber-store --store ./store commit create --ref main --author 'Ann <ann@example.com>' -m 'first' KEY  # record a tree; --parent KEY|ref:NAME links history; --change-id HEX carries a change id
 amber-store --store ./store commit show ref:main        # print a commit, git cat-file style
 ```
 
 A commit key, or a reference to one, works wherever a directory `KEY` does — it
-stands for the commit's tree.
+stands for the commit's tree. So does a directory entry that holds a commit:
+`ls`, `export` and `restore` skip the commit object and continue with its tree.
 
 Ingest parallelism is set with `--jobs` (default: number of CPUs). Chunking is
 tunable with `--min/--avg/--max` (ultracdc byte chunking) and `--item-bits`
@@ -152,7 +153,7 @@ root. `--no-ignore` disables all ignore processing.
 | [`architecture/amberpack.md`](architecture/amberpack.md) | The flat pack stream: record framing, CRCs, recovery. |
 | [`architecture/packstore.md`](architecture/packstore.md) | The store directory, the sidecar index of active segments, and the rules for sharing a store between processes. |
 | [`architecture/references.md`](architecture/references.md) | Named pointers to keys: record layout, name rules, storage. |
-| [`architecture/commits.md`](architecture/commits.md) | The commit object: record layout, signing convention, reachability, golden vector. |
+| [`architecture/commits.md`](architecture/commits.md) | The commit object: record layout, conflicts and the change id, the footprint length, signing convention, reachability, commits inside directories, golden vectors. |
 
 ## Development
 

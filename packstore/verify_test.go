@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/key"
 )
 
@@ -210,22 +211,56 @@ func TestVerifyScrubHashMismatchIsCorrupt(t *testing.T) {
 	}
 }
 
+// A commit's length field is a footprint: its own bytes plus every tree it
+// records. The store checks it, decoding the commit to learn the trees.
 func TestVerifyObjectChecksCommitLength(t *testing.T) {
-	// verifyObject does not parse payloads, so any bytes serve.
-	data := []byte("stand-in for a commit's canonical CBOR")
-	good, err := key.New(key.Commit, uint64(len(data)), data)
+	tree, err := key.New(key.DirLeaf, 1, []byte{0x80})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := commit.Identity{Name: "Ann", When: 1}
+	resolved := commit.Commit{Tree: tree, Author: id, Committer: id, Message: "m"}
+	good, data, err := resolved.Object()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := verifyObject(Object{Key: good, Data: data}); err != nil {
-		t.Fatalf("honest commit key rejected: %v", err)
+		t.Fatalf("an honest commit key was rejected: %v", err)
 	}
-	// Same payload hash, but a length field that lies about the byte length.
-	bad, err := key.New(key.Commit, uint64(len(data))+1, data)
+	// The rule of the first release: own bytes only. Same hash, wrong length.
+	ownOnly, err := key.New(key.Commit, uint64(len(data)), data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyObject(Object{Key: bad, Data: data}); !errors.Is(err, ErrVerify) {
-		t.Fatalf("err = %v, want ErrVerify for a wrong length field", err)
+	if err := verifyObject(Object{Key: ownOnly, Data: data}); !errors.Is(err, ErrVerify) {
+		t.Fatalf("err = %v, want ErrVerify for a length that leaves the tree out", err)
+	}
+
+	remove, _ := key.NewFromHash(key.DirLeaf, 300, [32]byte{1})
+	add, _ := key.NewFromHash(key.DirNode, 70000, [32]byte{2})
+	conflicted := resolved
+	conflicted.ConflictTerms = []key.Key{remove, add}
+	goodC, dataC, err := conflicted.Object()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyObject(Object{Key: goodC, Data: dataC}); err != nil {
+		t.Fatalf("an honest conflicted commit key was rejected: %v", err)
+	}
+	firstTreeOnly, err := key.New(key.Commit, uint64(len(dataC))+tree.Length(), dataC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyObject(Object{Key: firstTreeOnly, Data: dataC}); !errors.Is(err, ErrVerify) {
+		t.Fatalf("err = %v, want ErrVerify for a length that leaves conflict terms out", err)
+	}
+
+	junk := []byte("not a commit")
+	k, err := key.New(key.Commit, uint64(len(junk)), junk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyObject(Object{Key: k, Data: junk}); !errors.Is(err, ErrVerify) {
+		t.Fatalf("err = %v, want ErrVerify for bytes that are no commit", err)
 	}
 }

@@ -13,8 +13,12 @@ import (
 // greatest entry name in that child's subtree), then scans the one DirLeaf
 // that could hold the name — O(log n) objects for an n-entry directory. A
 // missing name wraps ErrNotFound; get fetches the bytes stored under a key.
+// dir may be the key of a Commit, which stands for its tree (DirOf).
 func LookupEntry(dir key.Key, name []byte, get func(key.Key) ([]byte, error)) (Entry, error) {
-	k := dir
+	k, err := DirOf(dir, get) // a commit stands for its tree: here, and nowhere further down
+	if err != nil {
+		return Entry{}, err
+	}
 	for {
 		data, err := get(k)
 		if err != nil {

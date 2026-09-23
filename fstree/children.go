@@ -3,15 +3,16 @@ package fstree
 import (
 	"fmt"
 
-	"github.com/amber-store/core/commit"
 	"github.com/amber-store/core/key"
 )
 
 // ChildKeys returns the keys directly referenced by the object with key k
 // and serialized bytes data, in encounter order. Blob and XattrSet objects
-// are leaves and have no children. A Commit's children are its tree, then
-// its parents in recorded order — so every walk built on ChildKeys follows
-// history.
+// are leaves and have no children. A Commit's children are its tree, the
+// further terms of a conflicted tree, then its parents, all in recorded order
+// — so every walk built on ChildKeys follows history and keeps every side of
+// a conflict. A DirLeaf's children are its entries' content keys whatever
+// their type, so a directory entry that holds a Commit is followed too.
 func ChildKeys(k key.Key, data []byte) ([]key.Key, error) {
 	switch k.Type() {
 	case key.Blob, key.XattrSet:
@@ -60,12 +61,13 @@ func ChildKeys(k key.Key, data []byte) ([]key.Key, error) {
 		}
 		return out, nil
 	case key.Commit:
-		c, err := commit.Decode(data)
+		c, err := decodeCommit(k, data) // and hold k to the key rule: see there
 		if err != nil {
-			return nil, fmt.Errorf("fstree: decoding Commit %s: %w", k, err)
+			return nil, err
 		}
-		out := make([]key.Key, 0, 1+len(c.Parents))
-		out = append(out, c.Tree)
+		trees := c.Trees()
+		out := make([]key.Key, 0, len(trees)+len(c.Parents))
+		out = append(out, trees...)
 		return append(out, c.Parents...), nil
 	default:
 		return nil, fmt.Errorf("fstree: unknown object type %s", k.Type())
