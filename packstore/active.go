@@ -173,8 +173,12 @@ func (s *Store) createActive(maxID uint64) error {
 			f.Close()
 			os.Remove(tmp)
 		}
-		if ok, err := tryLock(f); err != nil || !ok {
-			f.Close() // somebody took it for the leftover of a crash and is removing it
+		// A store clearing away what crashes left behind may have taken the
+		// file for such a leftover in the instant before this lock: it holds
+		// the lock, or it has already removed the file and let go. Either
+		// way the file is lost; claim the next id.
+		if ok, err := tryLock(f); err != nil || !ok || !isFileAt(f, tmp) {
+			f.Close()
 			if err != nil {
 				return err
 			}
