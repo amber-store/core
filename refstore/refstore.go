@@ -31,9 +31,10 @@ var ErrNotFound = errors.New("refstore: reference not found")
 // serialized in-process by writeMu, so they queue on the mutex rather than
 // polling SQLite's file lock, and across processes by SQLite itself.
 type Store struct {
-	db      *sql.DB
-	q       *refsdb.Queries
-	writeMu sync.Mutex
+	db         *sql.DB
+	q          *refsdb.Queries
+	writeMu    sync.Mutex
+	syncWrites bool // Open's sync flag: whether a commit is fsynced
 }
 
 // Open opens (creating if missing) the refs database in dir. sync selects
@@ -50,7 +51,7 @@ func Open(dir string, sync bool) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db, q: refsdb.New(db)}, nil
+	return &Store{db: db, q: refsdb.New(db), syncWrites: sync}, nil
 }
 
 // Put stores record under name, overwriting unconditionally.
