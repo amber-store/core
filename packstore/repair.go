@@ -15,6 +15,17 @@ import (
 // Existing readers retain their old mappings until their walks finish.
 // New objects use the configured write durability, like Put.
 func (s *Store) PutVerified(k key.Key, data []byte) error {
+	return s.putVerified(k, data, true)
+}
+
+// PutVerifiedDeferred is PutVerified without the fsync of a new or healthy
+// active record. The caller ends a run of these with Sync, and must not treat
+// the content as stored before that returns. Repairs still sync.
+func (s *Store) PutVerifiedDeferred(k key.Key, data []byte) error {
+	return s.putVerified(k, data, false)
+}
+
+func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	if err := verifyObject(Object{Key: k, Data: data}); err != nil {
 		return err
 	}
@@ -64,7 +75,7 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 		}
 	}
 	if found && !damaged {
-		if s.cfg.sync && s.active != nil {
+		if syncNow && s.cfg.sync && s.active != nil {
 			if _, ok := s.active.index[k]; ok {
 				if err := s.active.f.Sync(); err != nil {
 					s.setFailed(err)
@@ -80,7 +91,12 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 		return err
 	}
 	if !found {
-		return s.appendLocked(k, replacement, true)
+		if !syncNow {
+			// Before the append: Put reads the flag without appendMu, once
+			// it has found the record.
+			s.deferred.Store(true)
+		}
+		return s.appendLocked(k, replacement, syncNow)
 	}
 	// Seal from the live index: a prefix scan would discard later records
 	// after a damaged active record.
