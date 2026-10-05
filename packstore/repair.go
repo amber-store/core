@@ -85,7 +85,6 @@ func (s *Store) PutVerified(k key.Key, data []byte) error {
 	// Seal from the live index: a prefix scan would discard later records
 	// after a damaged active record.
 	if err := s.sealActiveLocked(); err != nil {
-		s.setFailed(err)
 		return err
 	}
 	s.mu.RLock()

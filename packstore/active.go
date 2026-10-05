@@ -322,7 +322,6 @@ func (s *Store) sealIdleLocked() error {
 			continue
 		}
 		if err := s.sealActiveLocked(); err != nil {
-			s.setFailed(err)
 			return err
 		}
 		if s.active != nil {

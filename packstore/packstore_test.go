@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/amber-store/core/amberpack"
@@ -809,6 +810,55 @@ func TestWipeClearsPoisonedWritePath(t *testing.T) {
 		if err := s.Put(o.Key, o.Data); err != nil {
 			t.Fatalf("Put after Wipe on previously-poisoned store: %v", err)
 		}
+	}
+}
+
+// A footer that does not fit is cut off again, so the segment stays active
+// and the store writable; any other footer error still poisons.
+func TestSealOutOfRoomLeavesTheStoreWritable(t *testing.T) {
+	for _, tc := range []struct {
+		errno   syscall.Errno
+		poisons bool
+	}{{syscall.ENOSPC, false}, {syscall.EDQUOT, false}, {syscall.EIO, true}} {
+		t.Run(tc.errno.Error(), func(t *testing.T) {
+			dir := t.TempDir()
+			objs := testObjects(t, 4)
+			s := openStore(t, dir, WithSegmentSize(2048))
+			s.afterFooter = func() error { return tc.errno }
+			if err := s.Put(objs[0].Key, objs[0].Data); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Put(objs[1].Key, objs[1].Data); !errors.Is(err, tc.errno) {
+				t.Fatalf("sealing Put: %v, want %v", err, tc.errno)
+			}
+			s.afterFooter = nil
+			if tc.poisons {
+				if err := s.Put(objs[2].Key, objs[2].Data); err == nil {
+					t.Fatal("poisoned store accepted a write")
+				}
+				return
+			}
+			if s.active == nil {
+				t.Fatal("the segment is no longer active")
+			}
+			path, size := s.active.path, s.active.size
+			if fi, err := os.Stat(path); err != nil || fi.Size() != size {
+				t.Fatalf("active segment: %v %v, want %d bytes", fi, err, size)
+			}
+			if err := s.Put(objs[2].Key, objs[2].Data); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("the retried seal left %s: %v", path, err)
+			}
+			if err := s.Put(objs[3].Key, objs[3].Data); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			wantObjects(t, openStore(t, dir), objs)
+		})
 	}
 }
 
