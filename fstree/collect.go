@@ -24,6 +24,14 @@ var ErrNotDir = errors.New("not a directory")
 // accepted; ".." is rejected (a CAS tree has no parent links). A missing
 // component wraps ErrNotFound, a non-directory component wraps ErrNotDir.
 func ResolvePath(root key.Key, path string, get func(key.Key) ([]byte, error)) (key.Key, error) {
+	return walkPath(root, path, func(dir key.Key, name []byte) (Entry, error) {
+		return LookupEntry(dir, name, get)
+	})
+}
+
+// walkPath is ResolvePath over any lookup of one name in one directory:
+// LookupEntry for the function, a DirectoryReader's own for its method.
+func walkPath(root key.Key, path string, lookup func(dir key.Key, name []byte) (Entry, error)) (key.Key, error) {
 	k := root
 	for comp := range strings.SplitSeq(path, "/") {
 		if comp == "" || comp == "." {
@@ -32,7 +40,7 @@ func ResolvePath(root key.Key, path string, get func(key.Key) ([]byte, error)) (
 		if comp == ".." {
 			return key.Key{}, fmt.Errorf("fstree: %q: \"..\" is not supported", path)
 		}
-		found, err := LookupEntry(k, []byte(comp), get)
+		found, err := lookup(k, []byte(comp))
 		if err != nil {
 			return key.Key{}, err
 		}
@@ -56,6 +64,14 @@ func ResolvePath(root key.Key, path string, get func(key.Key) ([]byte, error)) (
 // directories (ErrNotDir otherwise); a missing component wraps ErrNotFound;
 // ".." is rejected.
 func ResolveEntry(root key.Key, path string, get func(key.Key) ([]byte, error)) (*Entry, error) {
+	return walkEntry(root, path, func(dir key.Key, name []byte) (Entry, error) {
+		return LookupEntry(dir, name, get)
+	})
+}
+
+// walkEntry is ResolveEntry over any lookup of one name in one directory, as
+// walkPath is ResolvePath. The entry it returns is the one lookup returned.
+func walkEntry(root key.Key, path string, lookup func(dir key.Key, name []byte) (Entry, error)) (*Entry, error) {
 	dir := root
 	var cur *Entry // entry of dir; nil while dir is the root
 	for comp := range strings.SplitSeq(path, "/") {
@@ -75,7 +91,7 @@ func ResolveEntry(root key.Key, path string, get func(key.Key) ([]byte, error)) 
 			}
 			dir = ck
 		}
-		ent, err := LookupEntry(dir, []byte(comp), get)
+		ent, err := lookup(dir, []byte(comp))
 		if err != nil {
 			return nil, err
 		}
