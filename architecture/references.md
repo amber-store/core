@@ -85,6 +85,14 @@ first opens fail. Write durability follows the store's sync flag:
 `synchronous=FULL` with `fullfsync` and `checkpoint_fullfsync` on, or
 `synchronous=NORMAL` without.
 
+A **volatile** write is the exception. With the sync flag on, an
+implementation may commit a single record at `synchronous=NORMAL`, which in
+WAL mode skips the fsync of that commit. It is for records their owner
+discards when it starts, such as a session's pins: the most recent ones can
+be lost with the machine, while the database stays consistent. `synchronous`
+is a setting of the connection, so it is back at `FULL` before that
+connection runs any other write.
+
 ### Rules for implementations
 
 An implementation that shares a store with others follows these; they are
