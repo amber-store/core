@@ -37,6 +37,10 @@ func Extract(r io.Reader, destDir string) error {
 		if err != nil {
 			return err
 		}
+		// Archive-wide metadata, not a member; `git archive` writes one.
+		if h.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
 		target, err := safeJoin(destDir, h.Name)
 		if err != nil {
 			return err

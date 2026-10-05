@@ -82,6 +82,47 @@ func TestExtract_RejectsUnsafeName(t *testing.T) {
 	}
 }
 
+func TestExtract_SkipsPAXGlobalHeader(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	g := &tar.Header{
+		Name:       "pax_global_header",
+		Typeflag:   tar.TypeXGlobalHeader,
+		PAXRecords: map[string]string{"comment": "0e7b0ccc10ca"},
+		Format:     tar.FormatPAX,
+	}
+	if err := tw.WriteHeader(g); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "source/", Typeflag: tar.TypeDir, Mode: 0o755, Format: tar.FormatPAX}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "source/README", Typeflag: tar.TypeReg, Mode: 0o644, Size: 2, Format: tar.FormatPAX}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := filepath.Join(t.TempDir(), "out")
+	if err := tarextract.Extract(&buf, dest); err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, "source", "README"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hi" {
+		t.Fatalf("README = %q, want hi", got)
+	}
+	if _, err := os.Lstat(filepath.Join(dest, "pax_global_header")); !os.IsNotExist(err) {
+		t.Fatalf("pax_global_header was extracted: %v", err)
+	}
+}
+
 func buildTar(t *testing.T, entries ...*tar.Header) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
