@@ -108,6 +108,51 @@ func TestRefPutDuringMark(t *testing.T) {
 	}
 }
 
+// TestRunWithCopyBudgetCapsTheSweep: the budget reaches the sweep. The few
+// live objects share their pack with dead ones, and the packs after it hold
+// nothing live. A cycle with no room to copy reaps those and leaves the
+// shared pack to the next cycle, which has room.
+func TestRunWithCopyBudgetCapsTheSweep(t *testing.T) {
+	ts := newTestStore(t, 4<<10)
+	c := ts.openCollector(t, Options{Grace: time.Hour})
+	rootKeep, keysKeep := storeTree(t, ts.objects, "keep", 4)
+	rootDead, _ := storeTree(t, ts.objects, "dead", 80)
+	putTestRef(t, c, ts.refs, "keep", rootKeep)
+	putTestRef(t, c, ts.refs, "dead", rootDead)
+	rmTestRef(t, c, ts.refs, "dead", rootDead)
+	backdatePacks(t, ts)
+
+	keepIsLive := func(when string) {
+		t.Helper()
+		for _, k := range keysKeep {
+			if _, err := ts.objects.Get(k); err != nil {
+				t.Fatalf("live key %s after %s: %v", k, when, err)
+			}
+		}
+	}
+
+	capped, err := c.RunWithCopyBudget(context.Background(), 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capped.Reaped) == 0 {
+		t.Fatalf("a zero budget reaped no fully dead pack: %+v", capped)
+	}
+	if capped.CopiedRecords != 0 || capped.CopiedBytes != 0 {
+		t.Fatalf("a zero budget copied %d records, %d bytes: %+v", capped.CopiedRecords, capped.CopiedBytes, capped)
+	}
+	keepIsLive("the capped cycle")
+
+	rest, err := c.Run(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rest.CopiedRecords == 0 {
+		t.Fatalf("the capped cycle left nothing that needed a copy, so the test proves nothing: %+v", rest)
+	}
+	keepIsLive("the uncapped cycle")
+}
+
 func TestRunOverlapRefused(t *testing.T) {
 	ts := newTestStore(t, 1<<20)
 	c := ts.openCollector(t, Options{})

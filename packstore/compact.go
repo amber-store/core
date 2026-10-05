@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"iter"
+	"math"
 	"os"
 	"runtime"
 	"time"
@@ -50,6 +51,23 @@ type CompactOpts struct {
 	// Pace, when non-nil, is called with each copied record's size; the
 	// collector uses it to cap copy bandwidth.
 	Pace func(n int)
+	// MaxCopyBytes, when non-nil, caps the live record bytes this pass
+	// copies. Victim selection skips a segment whose live bytes exceed what
+	// is left of the cap and goes on to smaller ones, so the pass never
+	// copies more. Record bytes only: footers and allocation overhead sit
+	// outside it. At a cap of 0 fully dead segments are still reclaimed,
+	// since those need no copy, and nothing is sealed, since a footer would
+	// grow the store. Nil, the zero value, means no cap.
+	MaxCopyBytes *uint64
+}
+
+// copyBudget is the live record bytes the pass may copy: more than any
+// segment holds when there is no cap.
+func (o CompactOpts) copyBudget() uint64 {
+	if o.MaxCopyBytes == nil {
+		return math.MaxUint64
+	}
+	return *o.MaxCopyBytes
 }
 
 type CompactStats struct {
@@ -129,7 +147,9 @@ func (s *Store) Liveness(live func(key.Key) bool) ([]SegmentLiveness, error) {
 // while copying), and deletes victims only after the copies are durable.
 // The caller must guarantee no ingest or reference publication overlaps
 // (specs/gc.qnt). A grey set captured since BeginBarrier is consumed and
-// kept alongside live.
+// kept alongside live. Under opts.MaxCopyBytes a segment the cap does not
+// cover is left for a later pass, and at a cap of 0 the active segment is
+// not sealed either.
 func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats, error) {
 	// Other stores' writers wait for the whole pass and look at the directory
 	// again afterwards (gate.go); inside a collector's BeginSweep the gate is
@@ -164,11 +184,18 @@ func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats
 	if failed != nil {
 		return stats, failed
 	}
-	if err := s.sealActiveLocked(); err != nil {
-		return stats, err
-	}
-	if err := s.sealIdleLocked(); err != nil {
-		return stats, err
+	// Sealing writes a footer, which grows the store. A zero budget asks for
+	// no growth, and must still reach the dead segments it can reclaim
+	// without copying. sealIdleLocked is skipped with it: it lets go of this
+	// store's segment on the premise that the seal emptied it, then adopts
+	// and seals whatever it finds, this one included.
+	if opts.copyBudget() > 0 {
+		if err := s.sealActiveLocked(); err != nil {
+			return stats, err
+		}
+		if err := s.sealIdleLocked(); err != nil {
+			return stats, err
+		}
 	}
 
 	victims, err := s.selectVictims(live, opts, &stats)
@@ -198,6 +225,7 @@ func (s *Store) selectVictims(live func(key.Key) bool, opts CompactOpts, stats *
 	s.mu.RUnlock()
 	stats.SegmentsScanned = len(segs)
 
+	copyLeft := opts.copyBudget()
 	var victims []*sealedSegment
 	for _, g := range segs {
 		if !opts.Horizon.IsZero() {
@@ -212,6 +240,12 @@ func (s *Store) selectVictims(live func(key.Key) bool, opts CompactOpts, stats *
 		info := g.liveness(live)
 		total := info.LiveBytes + info.DeadBytes
 		if info.DeadKeys > 0 && float64(info.DeadBytes) >= opts.MinDeadRatio*float64(total) {
+			// More to copy than is left of the budget: skipped. A smaller
+			// segment after it is still considered.
+			if info.LiveBytes > copyLeft {
+				continue
+			}
+			copyLeft -= info.LiveBytes
 			victims = append(victims, g)
 			stats.Victims = append(stats.Victims, g.id)
 		}
