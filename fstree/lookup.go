@@ -26,6 +26,15 @@ func LookupEntry(dir key.Key, name []byte, get func(key.Key) ([]byte, error)) (E
 		}
 		switch k.Type() {
 		case key.DirLeaf:
+			// A leaf in the form the encoder writes is answered by one
+			// pass over its bytes (scan.go). Any other body is left to the
+			// decoder below.
+			switch e, res := scanLeafEntry(data, name); res {
+			case scanFound:
+				return e, nil
+			case scanMissing:
+				return Entry{}, fmt.Errorf("fstree: %q: %w", name, ErrNotFound)
+			}
 			entries, err := DecodeDirLeaf(data)
 			if err != nil {
 				return Entry{}, fmt.Errorf("fstree: decoding DirLeaf %s: %w", k, err)
@@ -38,6 +47,17 @@ func LookupEntry(dir key.Key, name []byte, get func(key.Key) ([]byte, error)) (E
 			}
 			return Entry{}, fmt.Errorf("fstree: %q: %w", name, ErrNotFound)
 		case key.DirNode:
+			switch child, res := scanNode(data, name); res {
+			case scanFound:
+				ck, err := key.Parse(child)
+				if err != nil {
+					return Entry{}, fmt.Errorf("fstree: child key in DirNode %s: %w", k, err)
+				}
+				k = ck
+				continue
+			case scanMissing:
+				return Entry{}, fmt.Errorf("fstree: %q: %w", name, ErrNotFound)
+			}
 			pairs, err := DecodeDirNode(data)
 			if err != nil {
 				return Entry{}, fmt.Errorf("fstree: decoding DirNode %s: %w", k, err)
