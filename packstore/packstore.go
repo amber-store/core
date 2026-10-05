@@ -129,8 +129,9 @@ type Store struct {
 	refreshMu   sync.Mutex
 	refreshSeq  atomic.Uint64
 	refreshes   atomic.Int64
-	afterList   func() // test hook: runs when a refresh has listed the directory, before it opens anything
-	afterDetach func() // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
+	afterList   func()       // test hook: runs when a refresh has listed the directory, before it opens anything
+	afterDetach func()       // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
+	afterFooter func() error // test hook: runs when a seal wrote the footer, before it syncs; an error it returns stands in for the write's
 
 	gate *gate // gc.lock: writers against a sweep, across processes (gate.go)
 }
@@ -282,14 +283,7 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 		a.sc.synced(a.size)
 	}
 	if a.size >= s.cfg.segmentSize {
-		// A mid-seal failure can leave a renamed-but-unpublished segment or
-		// an un-mmap'd sealed file; reads stay correct (the fd is still
-		// open), but accepting further writes could append past a footer.
-		// Poison the write path; reopen recovers cleanly.
-		if err := s.sealActiveLocked(); err != nil {
-			s.setFailed(err)
-			return err
-		}
+		return s.sealActiveLocked()
 	}
 	return nil
 }
@@ -334,6 +328,13 @@ func (s *Store) setFailed(err error) {
 // sealActiveLocked seals the active segment: build the footer from the
 // in-RAM index (no body re-read), append it, fsync, rename to .seg, fsync the
 // directory, and swap in the mmap'd sealed segment. Called under appendMu.
+//
+// A failure poisons the write path: a mid-seal failure can leave a
+// renamed-but-unpublished segment or an un-mmap'd sealed file; reads stay
+// correct (the fd is still open), but accepting further writes could append
+// past a footer; reopen recovers cleanly. Running out of room for the footer
+// does not poison: nothing was renamed yet, so cutting the footer off leaves
+// a valid active segment, and a later seal tries again.
 func (s *Store) sealActiveLocked() error {
 	a := s.active
 	if a == nil || len(a.index) == 0 {
@@ -345,16 +346,34 @@ func (s *Store) sealActiveLocked() error {
 	}
 	footer, err := buildFooter(a.size, entries)
 	if err != nil {
+		s.setFailed(err)
 		return err
 	}
 	// The footer is located from EOF, so drop anything a failed WriteAt
 	// left past a.size.
-	if err := a.f.Truncate(a.size); err != nil {
+	err = a.f.Truncate(a.size)
+	if err == nil {
+		_, err = a.f.WriteAt(footer, a.size)
+	}
+	if err == nil && s.afterFooter != nil {
+		err = s.afterFooter()
+	}
+	if err != nil {
+		noRoom := errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT)
+		if !noRoom || a.f.Truncate(a.size) != nil {
+			s.setFailed(err)
+		}
 		return err
 	}
-	if _, err := a.f.WriteAt(footer, a.size); err != nil {
+	if err := s.finishSealLocked(a); err != nil {
+		s.setFailed(err)
 		return err
 	}
+	return nil
+}
+
+// finishSealLocked is sealActiveLocked's part after the footer is written.
+func (s *Store) finishSealLocked(a *activeSegment) error {
 	if err := a.f.Sync(); err != nil {
 		return err
 	}
