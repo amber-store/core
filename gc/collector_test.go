@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -254,6 +255,84 @@ func TestWhy(t *testing.T) {
 	}
 	if len(names) != 0 {
 		t.Fatalf("Why after rm = %v, want none", names)
+	}
+}
+
+func TestUnreachableFromSeparatesReachedFromUnreached(t *testing.T) {
+	ts := newTestStore(t, 1<<20)
+	c := ts.openCollector(t, Options{})
+	rootA, keysA := storeTree(t, ts.objects, "a", 4)
+	rootB, keysB := storeTree(t, ts.objects, "b", 4)
+	ctx := context.Background()
+
+	candidates := slices.Concat(keysA, keysB)
+	dead, err := c.UnreachableFrom(ctx, []key.Key{rootA}, candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keysA {
+		if slices.Contains(dead, k) {
+			t.Fatalf("a-key %s reported unreachable from root a", k)
+		}
+	}
+	for _, k := range keysB {
+		if !slices.Contains(dead, k) {
+			t.Fatalf("b-key %s reported reachable from root a", k)
+		}
+	}
+
+	// Both roots together reach everything.
+	dead, err = c.UnreachableFrom(ctx, []key.Key{rootA, rootB}, candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dead) != 0 {
+		t.Fatalf("dead = %v, want none", dead)
+	}
+
+	// An empty root set reaches nothing, so every candidate comes back, in order.
+	dead, err = c.UnreachableFrom(ctx, nil, candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(dead, candidates) {
+		t.Fatalf("with no roots: dead = %v, want %v", dead, candidates)
+	}
+}
+
+func TestUnreachableFromTakesNoReferencesIntoAccount(t *testing.T) {
+	ts := newTestStore(t, 1<<20)
+	c := ts.openCollector(t, Options{})
+	root, keys := storeTree(t, ts.objects, "a", 4)
+	putTestRef(t, c, ts.refs, "held", root)
+
+	// A reference protects the tree from a real cycle, but it is not a root
+	// the caller passed, so it does not enter this answer.
+	dead, err := c.UnreachableFrom(context.Background(), nil, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(dead, keys) {
+		t.Fatalf("a reference must not act as a root here: dead = %v, want %v", dead, keys)
+	}
+}
+
+// TestUnreachableFromDoesNotWaitForCycle pins UnreachableFrom off cycleMu,
+// where Status is pinned to it. The slot is held here as it is by a cycle
+// that waits for the caller's own write span: an UnreachableFrom that waited
+// for the slot in turn would never return, and this test would hang.
+func TestUnreachableFromDoesNotWaitForCycle(t *testing.T) {
+	ts := newTestStore(t, 1<<20)
+	c := ts.openCollector(t, Options{})
+	root, keys := storeTree(t, ts.objects, "a", 4)
+	c.cycleMu.Lock()
+	defer c.cycleMu.Unlock()
+	dead, err := c.UnreachableFrom(context.Background(), []key.Key{root}, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dead) != 0 {
+		t.Fatalf("dead = %v, want none", dead)
 	}
 }
 

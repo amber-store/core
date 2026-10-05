@@ -134,6 +134,31 @@ func (c *Collector) Why(k key.Key) ([]string, error) {
 	return names, nil
 }
 
+// UnreachableFrom returns the candidates that roots does not reach, in the
+// order they were given. The mark starts from roots alone: a published
+// reference is not a root here unless the caller passes its key. Advisory:
+// the walk takes no barrier and no reference lock, so the caller must keep
+// roots, and anything published since, alive while it acts on the answer.
+// Deletes nothing.
+func (c *Collector) UnreachableFrom(ctx context.Context, roots, candidates []key.Key) ([]key.Key, error) {
+	// No cycle slot either, unlike Status: the mark set owns its footer
+	// indexes and the walk reads through the store's own lock, so a sweep
+	// alongside unmaps nothing under it. Waiting for the slot would
+	// deadlock a caller that asks from inside a write span against a cycle
+	// that is waiting for that span.
+	live, err := c.markLive(ctx, roots)
+	if err != nil {
+		return nil, err
+	}
+	var dead []key.Key
+	for _, k := range candidates {
+		if !live.Contains(k) {
+			dead = append(dead, k)
+		}
+	}
+	return dead, nil
+}
+
 // reaches walks root's tree until k is found, pruning revisited subtrees.
 func (c *Collector) reaches(root, k key.Key) (bool, error) {
 	visited := map[key.Key]bool{}
