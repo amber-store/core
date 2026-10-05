@@ -107,9 +107,14 @@ func (s *Store) adopt(id uint64, path string) (bool, error) {
 		return false, err
 	}
 	if res.sealed {
-		// A crash between the footer's write and the rename: finish it.
+		// A crash between the footer's write and the rename: finish it. The
+		// crash may also have come before the seal's fsync, and a sealed
+		// segment is trusted as durable from here on.
 		sealedPath := strings.TrimSuffix(path, ".active")
-		err := os.Rename(path, sealedPath)
+		err := f.Sync()
+		if err == nil {
+			err = os.Rename(path, sealedPath)
+		}
 		if err == nil {
 			err = s.dirF.Sync()
 		}

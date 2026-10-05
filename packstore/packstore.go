@@ -123,6 +123,10 @@ type Store struct {
 	writes   map[*writeToken]time.Time // in-flight Put/WriteBatch/WriteParallel starts
 
 	fsyncs atomic.Int64 // active-segment fsyncs issued, for tests
+	// deferred is set while PutVerifiedDeferred has appended records that no
+	// fsync has covered yet. A write that promises durability and finds its
+	// key already in the active segment checks it.
+	deferred atomic.Bool
 
 	// refreshSeq counts refreshes of the view, so that a lookup that waited
 	// for one does not repeat it; refreshes counts them for tests.
@@ -257,7 +261,17 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	}
 	a := s.active
 	if _, ok := a.index[k]; ok {
-		return nil // lost a Put race for this key; the record is already appended
+		// Lost a Put race for this key; the record is already appended. The
+		// winner may have been a deferred put, which has not synced it.
+		if syncNow && s.cfg.sync && s.deferred.Load() {
+			if err := a.f.Sync(); err != nil {
+				s.setFailed(err)
+				return err
+			}
+			a.sc.synced(a.size)
+			s.deferred.Store(false)
+		}
+		return nil
 	}
 	off := a.size
 	if _, err := a.f.WriteAt(rec, off); err != nil {
@@ -281,6 +295,7 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 			return err
 		}
 		a.sc.synced(a.size)
+		s.deferred.Store(false)
 	}
 	if a.size >= s.cfg.segmentSize {
 		return s.sealActiveLocked()
@@ -301,7 +316,12 @@ func (s *Store) syncActive() error {
 	if s.failed != nil {
 		return s.failed
 	}
-	if !s.cfg.sync || s.active == nil {
+	if !s.cfg.sync {
+		return nil
+	}
+	if s.active == nil {
+		// Sealing synced whatever a deferred put left behind.
+		s.deferred.Store(false)
 		return nil
 	}
 	if err := s.active.f.Sync(); err != nil {
@@ -309,6 +329,7 @@ func (s *Store) syncActive() error {
 		return err
 	}
 	s.active.sc.synced(s.active.size)
+	s.deferred.Store(false)
 	s.fsyncs.Add(1)
 	return nil
 }
@@ -457,6 +478,8 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 // Put stores a single object under k, deduplicating against existing content.
 // A dedup hit returns success without fsyncing; if the matching record was
 // appended by a still-running batch, its durability rides on that batch's commit.
+// Records that PutVerifiedDeferred left unsynced are the exception: a dedup
+// hit syncs them first.
 func (s *Store) Put(k key.Key, data []byte) error {
 	w, gerr := s.beginWrite()
 	if gerr != nil {
@@ -475,6 +498,11 @@ func (s *Store) Put(k key.Key, data []byte) error {
 		return err
 	}
 	if has {
+		// "Durably" trusts this store's own active records, and a deferred
+		// put leaves those unsynced.
+		if s.deferred.Load() {
+			return s.syncActive()
+		}
 		return nil
 	}
 	rec, err := amberpack.EncodeRecord(k, data)

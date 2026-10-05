@@ -360,3 +360,133 @@ func TestPutVerifiedConcurrentReadersAndWriters(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDeferredVerifiedPutsAreDurableAfterOneSync(t *testing.T) {
+	s := repairStore(t)
+	objs := testObjects(t, 3)
+	before := s.fsyncs.Load()
+	if err := s.PutVerifiedDeferred(objs[0].Key, []byte("wrong")); !errors.Is(err, ErrVerify) {
+		t.Fatal(err)
+	}
+	for _, o := range objs {
+		for range 2 { // a new record, then a healthy one
+			if err := s.PutVerifiedDeferred(o.Key, o.Data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		wantObjects(t, s, []Object{o})
+	}
+	if err := s.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.fsyncs.Load() - before; n != 1 {
+		t.Fatalf("%d fsyncs counted for a run of deferred puts and its Sync, want 1", n)
+	}
+	dir := s.dir
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openStore(t, dir)
+	wantObjects(t, reopened, objs)
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestADurablePutSyncsARecordADeferredPutLeftBehind(t *testing.T) {
+	s := repairStore(t)
+	o := blobObj(t, []byte("deferred, then promised"))
+	if err := s.PutVerifiedDeferred(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	before := s.fsyncs.Load()
+	if err := s.Put(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.fsyncs.Load() - before; n != 1 {
+		t.Fatalf("%d fsyncs for a Put that found a deferred record, want 1", n)
+	}
+	if err := s.Put(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.fsyncs.Load() - before; n != 1 {
+		t.Fatalf("%d fsyncs after a Put that found the record synced, want still 1", n)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Another store that syncs counts a record as a duplicate only as far as its
+// writer has synced it. A deferred put's record, new or found healthy by a
+// second deferred put, is synced by nobody until Sync.
+func TestDeferredVerifiedPutIsNotAdvertisedAsSyncedBeforeSync(t *testing.T) {
+	o := testObjects(t, 1)[0]
+	deferred := func(dir string) *Store {
+		w := openStore(t, dir)
+		for range 2 { // a new record, then a healthy one
+			if err := w.PutVerifiedDeferred(o.Key, o.Data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return w
+	}
+
+	dir := t.TempDir()
+	deferred(dir) // written, its writer still open and yet to sync
+	s := openStore(t, dir)
+	wantObjects(t, s, []Object{o})
+	putAll(t, s, []Object{o})
+	if !ownCopy(s, o.Key) {
+		t.Fatal("a syncing store acknowledged a write whose only copy is a deferred record its writer has yet to sync")
+	}
+
+	dir = t.TempDir()
+	if err := deferred(dir).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	s = openStore(t, dir)
+	wantObjects(t, s, []Object{o})
+	putAll(t, s, []Object{o})
+	if ownCopy(s, o.Key) {
+		t.Fatal("a second copy was written of a deferred record its writer had synced")
+	}
+}
+
+// syncedLen is the data length the sidecar of the store's own active segment
+// knows durable.
+func syncedLen(t *testing.T, s *Store) int64 {
+	t.Helper()
+	recs, _ := readSidecarFile(t, s.active.path+sidecarSuffix)
+	var n int64
+	for _, r := range recs {
+		if r.kind == sidecarSynced {
+			n = max(n, int64(r.off))
+		}
+	}
+	return n
+}
+
+// A Put that loses the race for its key to a deferred put finds the record in
+// the append path, past its duplicate check, and must not acknowledge it
+// unsynced.
+func TestAppendSyncsARecordADeferredPutLeftBehind(t *testing.T) {
+	s := repairStore(t)
+	o := blobObj(t, []byte("deferred, then raced"))
+	if err := s.PutVerifiedDeferred(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	if n := syncedLen(t, s); n >= s.active.size {
+		t.Fatalf("the sidecar knows %d of %d bytes synced before anything synced the deferred record", n, s.active.size)
+	}
+	rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.append(o.Key, rec, true); err != nil { // Put, having lost the race
+		t.Fatal(err)
+	}
+	if n := syncedLen(t, s); n != s.active.size {
+		t.Fatalf("the sidecar knows %d of %d bytes synced after a durable append found the deferred record", n, s.active.size)
+	}
+}
