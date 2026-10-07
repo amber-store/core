@@ -75,11 +75,21 @@ without the zstd bit as raw. An lz4 block that does not decode to exactly
 The segment magic, the wire pack magic, the footer and the sidecar do not
 change. The sidecar entry carries the flags byte without interpreting it.
 
-**Compatibility.** Releases up to 0.9.0 read raw and zstd records and reject an
-lz4 record as corrupt: a `Get` of it fails and a scrub reports it, and a wire
-pack containing one is refused as malformed. A store or a pack holding only
-codecs 0 and 1 stays readable by them. So lz4 is safe to turn on once every
-process and peer that reads the data runs this release.
+**Compatibility.** Releases up to 0.9.0 read raw and zstd records. A store or
+a pack holding only codecs 0 and 1 stays readable by them.
+
+*Corrected on 2026-10-07, after the branch review ran v0.9.0 against an lz4
+store.* This section first said that those releases reject an lz4 record as
+corrupt. Their scrub does, and their wire-pack reader refuses a pack that
+holds one. Their read path does not: it tests only the zstd bit, so a `Get`
+returns the lz4 block itself as the object's bytes, without an error. And
+when such a release indexes an active segment by scanning it, it takes the
+first lz4 record for a torn tail and truncates there at its next write. The
+decision for an additive codec id rested on the wrong statement. The user's
+ruling on the correction: keep the codec id, and add a gate — a segment
+format version of its own for segments that hold lz4 records, so that those
+releases refuse the store — as a further change on the same branches, with
+its own design, before they merge.
 
 ## The compression value
 
