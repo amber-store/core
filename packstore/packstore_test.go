@@ -900,3 +900,49 @@ func TestSealTruncatesStaleBytesPastLogicalEnd(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenRefusesStoreOfAnotherFormatVersion(t *testing.T) {
+	// Segments written before the key layout changed carry format version 1.
+	// Opening such a store must fail and leave every file as it was.
+	for _, c := range []struct {
+		suffix  string
+		segSize int64 // small enough to seal, or large enough not to
+	}{
+		{activeSuffix, 1 << 30},
+		{sealedSuffix, 4 << 10},
+	} {
+		t.Run(c.suffix, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := Open(dir, WithSegmentSize(c.segSize), WithSync(false))
+			if err != nil {
+				t.Fatal(err)
+			}
+			putAll(t, s, testObjects(t, 40))
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			segs, err := filepath.Glob(filepath.Join(dir, "*"+c.suffix))
+			if err != nil || len(segs) == 0 {
+				t.Fatalf("segments %v, %v", segs, err)
+			}
+			old, err := os.ReadFile(segs[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			old[len(magicHeader)-1] = 0x01
+			if err := os.WriteFile(segs[0], old, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if s, err := Open(dir); !errors.Is(err, ErrUnsupportedVersion) {
+				if err == nil {
+					s.Close()
+				}
+				t.Fatalf("Open: err = %v, want ErrUnsupportedVersion", err)
+			}
+			if now, err := os.ReadFile(segs[0]); err != nil || !bytes.Equal(now, old) {
+				t.Fatalf("the refused segment was modified (err %v)", err)
+			}
+		})
+	}
+}

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/amber-store/core/fstree"
@@ -144,13 +146,28 @@ func TestWriter_AddRecord_RoundTrip(t *testing.T) {
 }
 
 func TestReader_RejectsLegacyVersions(t *testing.T) {
-	for _, magic := range []string{"AMBERPK\x01", "AMBERPK\x02"} {
+	// Version 3 is the current framing with keys in the earlier byte order.
+	for _, magic := range []string{"AMBERPK\x01", "AMBERPK\x02", "AMBERPK\x03"} {
 		var buf bytes.Buffer
 		buf.WriteString(magic)
 		buf.WriteByte(tagEnd)
-		if _, err := collect(t, NewReader(&buf)); !errors.Is(err, ErrMalformed) {
+		_, err := collect(t, NewReader(&buf))
+		if !errors.Is(err, ErrMalformed) {
 			t.Fatalf("magic %q: err = %v, want ErrMalformed", magic, err)
 		}
+		if want := fmt.Sprintf("version %d", magic[len(magic)-1]); !strings.Contains(err.Error(), want) {
+			t.Fatalf("magic %q: err = %v, want it to name %s", magic, err, want)
+		}
+	}
+}
+
+func TestWriter_WritesVersion4(t *testing.T) {
+	var buf bytes.Buffer
+	if err := NewWriter(&buf).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := buf.String(), "AMBERPK\x04\x00"; got != want {
+		t.Fatalf("empty pack = %q, want %q", got, want)
 	}
 }
 
@@ -195,7 +212,7 @@ func TestReader_NonCanonicalKeyRejected(t *testing.T) {
 	o := mkObj(t, []byte("payload"))
 	var k key.Key
 	copy(k[:], o.Key[:])
-	k[0] = 0xF0 // reserved type nibble -> key.Parse fails
+	k[key.Size-1] = 0xF0 // reserved type nibble -> key.Parse fails
 	rec, err := EncodeRecord(k, o.Bytes)
 	if err != nil {
 		t.Fatal(err)

@@ -5,7 +5,7 @@
 // A wire pack is a possibly-partial, unordered set of CAS objects (like a git
 // pack) carrying no root key. Layout:
 //
-//	Magic    "AMBERPK\x03"   8 bytes  (plaintext)
+//	Magic    "AMBERPK\x04"   8 bytes  (plaintext)
 //	Records  repeat: one EncodeRecord output each — a 46-byte header
 //	         (tag 0x01 + key[32] + flags + ulen + slen + CRC) followed by the payload
 //	End      0x00
@@ -19,8 +19,9 @@
 // happens in the storage path (packstore WriteParallel with Verify).
 //
 // Versions 1 and 2 ("AMBERPK\x01" / "AMBERPK\x02") were the older uncompressed
-// and whole-stream-zstd stream formats; they are no longer produced and are
-// rejected by the Reader.
+// and whole-stream-zstd stream formats, and version 3 was this layout with
+// keys in their earlier byte order (header byte first); they are no longer
+// produced and are rejected by the Reader.
 package amberpack
 
 import (
@@ -35,7 +36,7 @@ import (
 )
 
 // packMagic identifies the wire pack format and its version (the trailing byte).
-const packMagic = "AMBERPK\x03"
+const packMagic = "AMBERPK\x04"
 
 // tagEnd marks the end of the record stream. A record begins with tagChunk
 // (0x01, written by EncodeRecord), so the two are distinguished on the first byte.
@@ -143,6 +144,10 @@ func (r *Reader) Records() iter.Seq2[RawRecord, error] {
 		var magic [len(packMagic)]byte
 		if _, err := io.ReadFull(br, magic[:]); err != nil {
 			yield(RawRecord{}, fmt.Errorf("%w: reading magic: %v", ErrMalformed, err))
+			return
+		}
+		if v := len(packMagic) - 1; string(magic[:v]) == packMagic[:v] && magic[v] != packMagic[v] {
+			yield(RawRecord{}, fmt.Errorf("%w: pack format version %d, this release reads %d", ErrMalformed, magic[v], packMagic[v]))
 			return
 		}
 		if string(magic[:]) != packMagic {

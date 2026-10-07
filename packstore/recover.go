@@ -34,6 +34,9 @@ func scanActive(path string) (scanResult, error) {
 	if err != nil {
 		return res, err
 	}
+	if err := checkVersion(b); err != nil {
+		return res, err
+	}
 	if len(b) < len(magicHeader) || !bytes.Equal(b[:len(magicHeader)], magicHeader) {
 		// Header never made it to disk; nothing in this file was ever
 		// acknowledged (any successful fsync would have persisted the header

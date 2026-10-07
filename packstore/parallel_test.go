@@ -166,3 +166,23 @@ func TestWriteParallelSyncsOncePerRun(t *testing.T) {
 		t.Fatalf("%d fsyncs for one small run, want 1", n)
 	}
 }
+
+func TestSeenSetSpreadsKeysOfOneTypeAndLength(t *testing.T) {
+	// The shard must come from the hash end of the key: objects of one type
+	// and length share their length and header bytes.
+	s := newSeenSet()
+	for _, e := range testEntries(t, 2000) {
+		if !s.addIfAbsent(e.k) {
+			t.Fatalf("key %s reported as already seen", e.k)
+		}
+	}
+	used := 0
+	for i := range s.shards {
+		if len(s.shards[i].m) > 0 {
+			used++
+		}
+	}
+	if used < 200 {
+		t.Fatalf("2000 keys landed in %d of %d shards", used, len(s.shards))
+	}
+}

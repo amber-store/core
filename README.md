@@ -147,7 +147,7 @@ root. `--no-ignore` disables all ignore processing.
 
 | Document | Contents |
 |----------|----------|
-| [`architecture/keys.md`](architecture/keys.md)   | The 32-byte lookup key: header byte, payload length, truncated hash. |
+| [`architecture/keys.md`](architecture/keys.md)   | The 32-byte lookup key: truncated hash, payload length, header byte. |
 | [`architecture/types.md`](architecture/types.md) | The type model: object types, filesystem entry types, length-field semantics. |
 | [`architecture/fstree.md`](architecture/fstree.md) | On-the-wire CBOR layout of every type, the chunkers, tree construction, and read paths. |
 | [`architecture/amberpack.md`](architecture/amberpack.md) | The flat pack stream: record framing, CRCs, recovery. |
