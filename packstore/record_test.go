@@ -12,7 +12,7 @@ import (
 // the record bytes (a staged pack) offers instead of Data.
 func recordObj(t *testing.T, o Object) Object {
 	t.Helper()
-	rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+	rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestWriteParallelRecordVerifyCatchesWrongPayload(t *testing.T) {
 	// hash to its key: only Verify can tell, exactly as for Data.
 	s := openStore(t, t.TempDir())
 	objs := testObjects(t, 3)
-	rec, err := amberpack.EncodeRecord(objs[0].Key, append(bytes.Clone(objs[0].Data), 0xFF))
+	rec, err := amberpack.EncodeRecordWith(objs[0].Key, append(bytes.Clone(objs[0].Data), 0xFF), zstdDefault)
 	if err != nil {
 		t.Fatal(err)
 	}

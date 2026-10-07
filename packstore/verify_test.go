@@ -70,7 +70,7 @@ func TestVerifyDetectsWrongIndexEntry(t *testing.T) {
 	body = append(body, magicHeader...)
 	var entries []indexEntry
 	for _, o := range objs {
-		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +125,7 @@ func TestVerifyConcurrentWithClose(t *testing.T) {
 	// scrub gate makes Close wait for in-flight walks.
 	for round := 0; round < 5; round++ {
 		dir := sealedStore(t, testObjects(t, 200))
-		s, err := Open(dir)
+		s, err := Open(dir, WithCompression(zstdDefault))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +150,7 @@ func TestVerifyDetectsKeyCountMismatch(t *testing.T) {
 	body = append(body, magicHeader...)
 	var entries []indexEntry
 	for _, o := range objs {
-		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,7 +186,7 @@ func TestVerifyScrubHashMismatchIsCorrupt(t *testing.T) {
 		if i == 1 {
 			data = imposter.Data // encoded under good[1].Key: CRC fine, hash wrong
 		}
-		rec, err := amberpack.EncodeRecord(o.Key, data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}

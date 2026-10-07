@@ -34,7 +34,7 @@ func buildBody(t *testing.T, objs []Object) ([]byte, []recSpan) {
 	body := append([]byte{}, magicHeader...)
 	var spans []recSpan
 	for _, o := range objs {
-		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}

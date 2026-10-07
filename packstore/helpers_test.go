@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"testing"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/key"
 )
 
@@ -32,3 +33,8 @@ func incompressible(n int) []byte {
 func compressible(n int) []byte {
 	return bytes.Repeat([]byte("abcdefgh"), n/8+1)[:n]
 }
+
+// zstdDefault is what every store wrote with before compression became an
+// option. The tests written then still run under it, so they keep covering
+// stores that mix raw and compressed records.
+var zstdDefault = amberpack.Compression{Algorithm: amberpack.Zstd}

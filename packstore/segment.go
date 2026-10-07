@@ -56,7 +56,7 @@ func checkVersion(b []byte) error {
 
 // Object is one CAS object to store: its key and either its serialized
 // bytes (Data) or, for an object that was encoded elsewhere, the complete
-// record as amberpack.EncodeRecord produced it (Record). Exactly one of
+// record as amberpack.EncodeRecordWith produced it (Record). Exactly one of
 // the two is set. A Record is parsed (framing, CRC, canonical key, key
 // equal to Key) and appended verbatim, so a caller that already holds
 // encoded records, say a pack it staged on disk, skips the compression

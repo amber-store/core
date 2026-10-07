@@ -135,7 +135,7 @@ func (s *Store) runWriter(ctx context.Context, ch <-chan Object, seen *seenSet, 
 				deduped.Add(1)
 				continue
 			}
-			rec, ulen, err := prepare(obj, verify)
+			rec, ulen, err := s.prepare(obj, verify)
 			if err != nil {
 				return err
 			}

@@ -86,7 +86,7 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 		}
 		return nil
 	}
-	replacement, err := amberpack.EncodeRecord(k, data)
+	replacement, err := s.encode(k, data)
 	if err != nil {
 		return err
 	}

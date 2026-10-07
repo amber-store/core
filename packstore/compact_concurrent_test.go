@@ -13,7 +13,7 @@ import (
 // TestCompactDuringReads: reads stay correct while Compact unmaps
 // and deletes their segments.
 func TestCompactDuringReads(t *testing.T) {
-	s, err := Open(t.TempDir(), WithSegmentSize(8<<10), WithSync(false))
+	s, err := Open(t.TempDir(), WithSegmentSize(8<<10), WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}

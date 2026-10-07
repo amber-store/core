@@ -39,8 +39,10 @@ const (
 type Option func(*config)
 
 type config struct {
-	segmentSize int64
-	sync        bool
+	segmentSize    int64
+	sync           bool
+	compression    amberpack.Compression
+	compressionFor CompressionFunc
 }
 
 func defaultConfig() config {
@@ -188,6 +190,9 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	cfg := defaultConfig()
 	for _, o := range opts {
 		o(&cfg)
+	}
+	if err := cfg.compression.Validate(); err != nil {
+		return nil, fmt.Errorf("packstore: %w", err)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("packstore: creating %s: %w", dir, err)
@@ -463,7 +468,7 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 		if has {
 			continue
 		}
-		rec, _, err := prepare(obj, false)
+		rec, _, err := s.prepare(obj, false)
 		if err != nil {
 			return fail(err)
 		}
@@ -505,7 +510,7 @@ func (s *Store) Put(k key.Key, data []byte) error {
 		}
 		return nil
 	}
-	rec, err := amberpack.EncodeRecord(k, data)
+	rec, err := s.encode(k, data)
 	if err != nil {
 		return err
 	}
@@ -593,7 +598,7 @@ func (s *Store) get(k key.Key) ([]byte, error) {
 
 // GetRecord returns a caller-owned copy of the full on-disk record stored under
 // k — its 46-byte header plus the stored (still-compressed) payload, exactly as
-// written by amberpack.EncodeRecord — or ErrNotFound if k is absent. This is the
+// written by amberpack.EncodeRecordWith — or ErrNotFound if k is absent. This is the
 // zero-copy push path: the record is wire-format-identical, so a caller can hand
 // it to amberpack.Writer.AddRecord without decompressing and re-encoding. Like
 // Get, it does not CRC-check; the receiving Reader validates framing and CRC.
