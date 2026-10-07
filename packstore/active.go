@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -105,7 +106,13 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 	// a writer that can use it. One whose header never arrived is taken: it
 	// gets this store's.
 	header := make([]byte, len(magicHeader))
-	if n, _ := f.ReadAt(header, 0); n == len(header) && isHeader(header) && header[len(header)-1] < minVersion {
+	n, err := f.ReadAt(header, 0)
+	if err != nil && !errors.Is(err, io.EOF) { // short is fine: the header never arrived
+		f.Close()
+		return false, err
+	}
+	hasHeader := n == len(header) && isHeader(header)
+	if hasHeader && header[len(header)-1] < minVersion {
 		f.Close()
 		return false, nil
 	}
@@ -143,7 +150,13 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 		return false, nil
 	}
 	size := res.dataEnd
-	version := header[len(header)-1] // recovery accepted the file, so this is a header
+	version := header[len(header)-1]
+	if size >= int64(len(magicHeader)) && !hasHeader {
+		// Recovery found records behind something that is not a header this
+		// release reads: it cannot have, and nothing may be appended here.
+		f.Close()
+		return false, fmt.Errorf("%w: %s: records behind an unreadable header", ErrCorrupt, path)
+	}
 	if size < int64(len(magicHeader)) {
 		// The header never became durable, so nothing in the file was ever
 		// acknowledged: start it over. Deliberate and silent.

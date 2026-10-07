@@ -438,3 +438,102 @@ func TestOpenRefusesAVersionBeyondTheOnesItReads(t *testing.T) {
 		t.Fatalf("Open: err = %v, want ErrUnsupportedVersion", err)
 	}
 }
+
+// TestLeavingForAVersion3SegmentChecksItForTheKey covers the handle that has
+// to leave its version-2 segment for an lz4 record and, in doing so, adopts a
+// version-3 segment another writer left behind — one that already holds that
+// very record, not yet known durable. The record must not be appended to the
+// segment a second time: a sealed segment with a key twice fails the scrub.
+func TestLeavingForAVersion3SegmentChecksItForTheKey(t *testing.T) {
+	dir := t.TempDir()
+	objs := distinct(t, 2)
+	k0, k1 := objs[0], objs[1]
+
+	// W writes k1 as lz4 without syncing and stays open: its version-3
+	// segment is taken, so H below has to make one of its own.
+	w, err := Open(dir, WithSync(false), WithCompression(lz4Fast))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Put(k1.Key, k1.Data); err != nil {
+		t.Fatal(err)
+	}
+
+	var lz4On atomic.Bool
+	h, err := Open(dir, WithCompression(zstdDefault), WithCompressionFor(switchable(&lz4On)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if err := h.Put(k0.Key, k0.Data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// H now puts k1 as lz4: it leaves its version-2 segment and adopts W's.
+	lz4On.Store(true)
+	if err := h.Put(k1.Key, k1.Data); err != nil {
+		t.Fatal(err)
+	}
+
+	records := 0
+	for _, suffix := range []string{sealedSuffix, activeSuffix} {
+		paths, _ := filepath.Glob(filepath.Join(dir, "*"+suffix))
+		for _, p := range paths {
+			_, codecs := segmentRecords(t, p)
+			records += len(codecs)
+		}
+	}
+	if records != 2 {
+		t.Fatalf("the store holds %d records for 2 objects: %+v", records, segmentVersions(t, dir))
+	}
+	// Sealed, the segment must pass the scrub.
+	if err := h.sealActiveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mustGet(t, h, k0)
+	mustGet(t, h, k1)
+}
+
+func TestRepairKeepsTheVersionOfAVersion3Segment(t *testing.T) {
+	// Two lz4 records in a version-3 segment; one is damaged and repaired
+	// with a zstd replacement. The other lz4 record is still there, so the
+	// segment must stay at version 3.
+	lz4On := atomic.Bool{}
+	lz4On.Store(true)
+	s := rawStore(t, WithCompression(zstdDefault), WithCompressionFor(switchable(&lz4On)))
+	objs := distinct(t, 2)
+	for _, o := range objs {
+		if err := s.Put(o.Key, o.Data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	off := s.active.index[objs[0].Key].off
+	if err := s.sealActiveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	path := s.sealed[0].path
+	if v, codecs := segmentRecords(t, path); v != 3 || len(codecs) != 2 {
+		t.Fatalf("before the repair: version %d, records %v", v, codecs)
+	}
+	damageRepairRecord(t, path, off+amberpack.RecHeaderSize)
+	lz4On.Store(false)
+	if err := s.PutVerified(objs[0].Key, objs[0].Data); err != nil {
+		t.Fatal(err)
+	}
+	v, codecs := segmentRecords(t, path)
+	if v != 3 || len(codecs) != 2 || codecs[0] != amberpack.Zstd || codecs[1] != amberpack.LZ4 {
+		t.Fatalf("after the repair: version %d, records %v; want version 3, [zstd lz4]", v, codecs)
+	}
+	for _, o := range objs {
+		mustGet(t, s, o)
+	}
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}

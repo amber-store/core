@@ -133,6 +133,18 @@ segment, and releases up to 0.9.0 refuse that whole store instead of
 misreading it. A store that never sees lz4 stays at version 2 and stays
 readable by them.
 
+*Corrected after the gate's review, 2026-10-08.* "Every codec" above means
+the three that exist. This release's scan of an active segment takes a record
+of a codec it does not know for a torn tail, as 0.9.0's does, so a later
+codec has to take a later segment version of its own and may not join version
+3. The constants are named for lz4 accordingly (`versionLZ4`, `VERSION_LZ4`).
+The review also found that a handle leaving a version-2 segment could adopt a
+version-3 one that already held the record and append it a second time; the
+append path now checks every segment it takes. And an lz4 handle writes
+version-3 segments even while every record it has written so far is raw, so
+"never sees lz4" above reads: is never written to through a handle set to
+lz4, and never takes an lz4 record.
+
 Tests, in both languages: every segment stays at version 2 without lz4; an
 lz4 handle writes version 3 from the start; the first lz4 record from a
 callback, from a pre-encoded record and from a compaction copy moves the

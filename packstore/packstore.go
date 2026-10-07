@@ -268,39 +268,41 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	if s.failed != nil {
 		return s.failed
 	}
-	// A record beyond zstd goes into a segment at versionAnyCodec only, and
-	// a store that has written one stays at that version: it leaves a
-	// segment early once, not once per segment.
+	// An lz4 record goes into a segment at versionLZ4 only, and a store that
+	// has written one stays at that version: it leaves a segment early once,
+	// not once per segment.
 	need := versionFor(rec[33])
 	s.segVersion = max(s.segVersion, need)
-	if err := s.ensureActiveLocked(); err != nil {
-		return err
-	}
-	a := s.active
-	if _, ok := a.index[k]; ok {
-		// Lost a Put race for this key; the record is already appended. The
-		// winner may have been a deferred put, which has not synced it.
-		if syncNow && s.cfg.sync && s.deferred.Load() {
-			if err := a.f.Sync(); err != nil {
-				s.setFailed(err)
-				return err
-			}
-			a.sc.synced(a.size)
-			s.deferred.Store(false)
-		}
-		return nil
-	}
-	if a.version < need {
-		// The segment this store holds may not take the record. Its header
-		// is never rewritten: an older release that has read it would go on
-		// to misread what follows.
-		if err := s.leaveActiveLocked(); err != nil {
-			return err
-		}
+	var a *activeSegment
+	for {
 		if err := s.ensureActiveLocked(); err != nil {
 			return err
 		}
 		a = s.active
+		if _, ok := a.index[k]; ok {
+			// Lost a Put race for this key, or took over a segment that
+			// holds it: the record is already appended. Whoever appended it
+			// may have been a deferred put, which has not synced it.
+			if syncNow && s.cfg.sync && s.deferred.Load() {
+				if err := a.f.Sync(); err != nil {
+					s.setFailed(err)
+					return err
+				}
+				a.sc.synced(a.size)
+				s.deferred.Store(false)
+			}
+			return nil
+		}
+		if a.version >= need {
+			break
+		}
+		// The segment this store holds may not take the record. Its header
+		// is never rewritten: an older release that has read it would go on
+		// to misread what follows. The segment taken instead is checked for
+		// the key like any other: it may be one somebody left behind.
+		if err := s.leaveActiveLocked(); err != nil {
+			return err
+		}
 	}
 	off := a.size
 	if _, err := a.f.WriteAt(rec, off); err != nil {
