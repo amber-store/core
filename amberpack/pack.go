@@ -10,7 +10,7 @@
 //	         (tag 0x01 + key[32] + flags + ulen + slen + CRC) followed by the payload
 //	End      0x00
 //
-// Each record is the same self-describing, CRC-protected, per-record-zstd unit
+// Each record is the same self-describing, CRC-protected, individually compressed unit
 // packstore writes on disk (see record.go); a wire pack is just those records
 // framed by a magic and an explicit end marker, so a truncated stream is
 // detected rather than read as a clean EOF. The Reader validates framing, CRC,

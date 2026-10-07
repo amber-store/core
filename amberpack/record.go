@@ -5,18 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"sync"
 
 	"github.com/amber-store/core/key"
 	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
 )
 
 const (
 	// RecHeaderSize is the fixed record-header length:
 	// tag(1) + key(32) + flags(1) + ulen(4) + slen(4) + crc(4). Payload follows.
+	// The flags byte holds the payload's codec id, an Algorithm value.
 	RecHeaderSize = 46
 
 	tagChunk byte = 0x01
-	flagZstd byte = 0x01
 
 	// MaxPayload bounds one object's payload, stored or decoded. The length
 	// fields are untrusted and size allocations. Real objects are ~1 MiB.
@@ -46,35 +48,108 @@ type Record struct {
 	Slen  uint32
 }
 
-// Shared zstd coders; EncodeAll/DecodeAll are safe for concurrent use.
-var (
-	zstdEnc *zstd.Encoder
-	zstdDec *zstd.Decoder
-)
+// zstdDec decodes every zstd record; DecodeAll is safe for concurrent use.
+var zstdDec *zstd.Decoder
 
 func init() {
 	var err error
-	if zstdEnc, err = zstd.NewWriter(nil); err != nil {
-		panic(err)
-	}
 	// CapLimit stops DecodeAll at the dst capacity DecodePayload sizes from ulen.
 	if zstdDec, err = zstd.NewReader(nil, zstd.WithDecodeAllCapLimit(true), zstd.WithDecoderMaxMemory(MaxPayload)); err != nil {
 		panic(err)
 	}
 }
 
-// EncodeRecord serializes (k, data) into a complete record, compressing the
-// payload with zstd when that makes it strictly smaller. k is written as given;
-// canonical-form validation happens on the read side.
+// zstdEncs holds one encoder per klauspost tier, built on first use: an
+// encoder's tables are sized by its tier, and most processes use one tier.
+// EncodeAll is safe for concurrent use.
+var zstdEncs [zstd.SpeedBestCompression]struct {
+	once sync.Once
+	enc  *zstd.Encoder
+}
+
+// zstdEncoder returns the encoder for a zstd level from 0 to 22. klauspost
+// has four tiers where zstd has 22 levels; EncoderLevelFromZstd picks the
+// nearest (1–2 fastest, 3–5 default, 6–9 better, 10–22 best).
+func zstdEncoder(level int) *zstd.Encoder {
+	if level == 0 {
+		level = 3 // zstd's own default
+	}
+	tier := zstd.EncoderLevelFromZstd(level)
+	e := &zstdEncs[tier-zstd.SpeedFastest]
+	e.once.Do(func() {
+		enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(tier))
+		if err != nil {
+			panic(err) // the options are fixed and valid
+		}
+		e.enc = enc
+	})
+	return e.enc
+}
+
+// The lz4 compressors carry hash tables and are not safe for concurrent use,
+// so they are pooled. Each resets its tables per block: the output depends
+// on the input alone.
+var (
+	lz4Fast = sync.Pool{New: func() any { return new(lz4.Compressor) }}
+	lz4HC   = sync.Pool{New: func() any { return new(lz4.CompressorHC) }}
+)
+
+// compress returns data compressed as c says, or nil when the payload is to
+// be stored raw: c is None, data is empty, the result would not be strictly
+// smaller, or the compressor reports data incompressible. c must be valid.
+func compress(c Compression, data []byte) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+	switch c.Algorithm {
+	case Zstd:
+		if out := zstdEncoder(c.Level).EncodeAll(data, make([]byte, 0, len(data))); len(out) < len(data) {
+			return out
+		}
+	case LZ4:
+		// One byte short of data: a block that is not strictly smaller does
+		// not fit, which the compressor reports with 0 or an error.
+		dst := make([]byte, len(data)-1)
+		var n int
+		var err error
+		if c.Level == 0 {
+			lc := lz4Fast.Get().(*lz4.Compressor)
+			n, err = lc.CompressBlock(data, dst)
+			lz4Fast.Put(lc)
+		} else {
+			hc := lz4HC.Get().(*lz4.CompressorHC)
+			// The HC levels here stop at 9; level n is a search depth of 1<<(8+n).
+			hc.Level = lz4.CompressionLevel(1 << (8 + min(c.Level, 9)))
+			n, err = hc.CompressBlock(data, dst)
+			lz4HC.Put(hc)
+		}
+		if err == nil && n > 0 {
+			return dst[:n]
+		}
+	}
+	return nil
+}
+
+// EncodeRecord serializes (k, data) into a complete record with the payload
+// stored raw. It is EncodeRecordWith with no compression.
 func EncodeRecord(k key.Key, data []byte) ([]byte, error) {
+	return EncodeRecordWith(k, data, Compression{})
+}
+
+// EncodeRecordWith serializes (k, data) into a complete record, compressing
+// the payload as c says when that makes it strictly smaller and storing it
+// raw otherwise. An invalid c is an error wrapping ErrInvalidCompression. k
+// is written as given; canonical-form validation happens on the read side.
+func EncodeRecordWith(k key.Key, data []byte, c Compression) ([]byte, error) {
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
 	if !payloadFits(len(data)) {
 		return nil, fmt.Errorf("amberpack: object %s too large: %d bytes", k, len(data))
 	}
-	payload := data
-	flags := byte(0)
-	if comp := zstdEnc.EncodeAll(data, make([]byte, 0, len(data))); len(comp) < len(data) {
-		payload = comp
-		flags = flagZstd
+	payload, flags := data, byte(None)
+	if comp := compress(c, data); comp != nil {
+		payload, flags = comp, byte(c.Algorithm)
 	}
 	rec := make([]byte, RecHeaderSize+len(payload))
 	rec[0] = tagChunk
@@ -105,7 +180,7 @@ func ParseRecord(b []byte) (Record, error) {
 		return Record{}, fmt.Errorf("%w: unexpected record tag %#x", ErrCorrupt, b[0])
 	}
 	flags := b[33]
-	if flags&^flagZstd != 0 {
+	if flags > byte(LZ4) {
 		return Record{}, fmt.Errorf("%w: unknown record flags %#x", ErrCorrupt, flags)
 	}
 	ulen := binary.BigEndian.Uint32(b[34:38])
@@ -113,13 +188,13 @@ func ParseRecord(b []byte) (Record, error) {
 	if int64(len(b)) < RecHeaderSize+int64(slen) {
 		return Record{}, fmt.Errorf("%w: truncated record payload", ErrCorrupt)
 	}
-	if flags&flagZstd == 0 && ulen != slen {
+	if flags == byte(None) && ulen != slen {
 		return Record{}, fmt.Errorf("%w: raw record with ulen %d != slen %d", ErrCorrupt, ulen, slen)
 	}
 	if ulen > MaxPayload {
 		return Record{}, fmt.Errorf("%w: record ulen %d exceeds limit %d", ErrCorrupt, ulen, MaxPayload)
 	}
-	if flags&flagZstd != 0 && slen >= ulen {
+	if flags != byte(None) && slen >= ulen {
 		return Record{}, fmt.Errorf("%w: compressed record with slen %d >= ulen %d", ErrCorrupt, slen, ulen)
 	}
 	c := crc32.Update(0, castagnoli, b[:42])
@@ -136,19 +211,35 @@ func ParseRecord(b []byte) (Record, error) {
 }
 
 // DecodePayload returns caller-owned payload bytes from a record's stored
-// payload. stored may be a read-only mmap slice and is never retained.
+// payload, decoded as the record's flags byte says. stored may be a read-only
+// mmap slice and is never retained.
 func DecodePayload(flags byte, ulen uint32, stored []byte) ([]byte, error) {
-	if flags&flagZstd == 0 {
+	switch Algorithm(flags) {
+	case None:
 		out := make([]byte, len(stored))
 		copy(out, stored)
 		return out, nil
+	case Zstd:
+		out, err := zstdDec.DecodeAll(stored, make([]byte, 0, ulen))
+		if err != nil {
+			return nil, fmt.Errorf("%w: zstd: %v", ErrCorrupt, err)
+		}
+		if uint32(len(out)) != ulen {
+			return nil, fmt.Errorf("%w: decompressed to %d bytes, header says %d", ErrCorrupt, len(out), ulen)
+		}
+		return out, nil
+	case LZ4:
+		// The block carries no length of its own: ulen sizes the output, and
+		// a block that would run past it fails inside the decoder.
+		out := make([]byte, ulen)
+		n, err := lz4.UncompressBlock(stored, out)
+		if err != nil {
+			return nil, fmt.Errorf("%w: lz4: %v", ErrCorrupt, err)
+		}
+		if uint32(n) != ulen {
+			return nil, fmt.Errorf("%w: decompressed to %d bytes, header says %d", ErrCorrupt, n, ulen)
+		}
+		return out, nil
 	}
-	out, err := zstdDec.DecodeAll(stored, make([]byte, 0, ulen))
-	if err != nil {
-		return nil, fmt.Errorf("%w: zstd: %v", ErrCorrupt, err)
-	}
-	if uint32(len(out)) != ulen {
-		return nil, fmt.Errorf("%w: decompressed to %d bytes, header says %d", ErrCorrupt, len(out), ulen)
-	}
-	return out, nil
+	return nil, fmt.Errorf("%w: unknown record flags %#x", ErrCorrupt, flags)
 }
