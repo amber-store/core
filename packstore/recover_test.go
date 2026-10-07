@@ -3,6 +3,7 @@ package packstore
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -125,6 +126,20 @@ func TestScanActiveBadHeaderResets(t *testing.T) {
 		}
 		if res.size != 0 || len(res.index) != 0 || res.sealed {
 			t.Fatalf("bad header: %+v", res)
+		}
+	}
+}
+
+func TestScanActiveRefusesAnotherFormatVersion(t *testing.T) {
+	// A header that is ours but of another version is not a torn header: the
+	// file holds acknowledged data this release cannot read, and resetting it
+	// would destroy that data.
+	body, _ := buildBody(t, testObjects(t, 2))
+	for _, version := range []byte{0x01, 0x03} {
+		old := bytes.Clone(body)
+		old[len(magicHeader)-1] = version
+		if _, err := scanActive(activeFile(t, old)); !errors.Is(err, ErrUnsupportedVersion) {
+			t.Fatalf("version %d: err = %v, want ErrUnsupportedVersion", version, err)
 		}
 	}
 }

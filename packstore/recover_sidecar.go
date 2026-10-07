@@ -144,6 +144,9 @@ func (sc *segmentScan) advance(data io.ReaderAt, size int64, tail []byte) (added
 		if err != nil {
 			return nil, nil, false, err
 		}
+		if err := checkVersion(header); err != nil {
+			return nil, nil, false, err
+		}
 		if !bytes.Equal(header, magicHeader) {
 			return nil, nil, true, nil
 		}

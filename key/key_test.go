@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/zeebo/blake3"
@@ -12,9 +13,9 @@ import (
 func TestAccessors_SingleByteLength(t *testing.T) {
 	// Blob, length 255 (lengthSize 1), 30-byte hash.
 	var k Key
-	k[0] = 0x00 // type 0, reserved 0, lengthSize-1 = 0
-	k[1] = 0xFF // length = 255
-	for i := 2; i < Size; i++ {
+	k[31] = 0x00 // type 0, reserved 0, lengthSize-1 = 0
+	k[30] = 0xFF // length = 255
+	for i := 0; i < 30; i++ {
 		k[i] = byte(i)
 	}
 	if k.Type() != Blob {
@@ -29,16 +30,19 @@ func TestAccessors_SingleByteLength(t *testing.T) {
 	if len(k.Hash()) != 30 {
 		t.Errorf("len(Hash()) = %d, want 30", len(k.Hash()))
 	}
-	if !bytes.Equal(k.Hash(), k[2:]) {
-		t.Errorf("Hash() = %x, want %x", k.Hash(), k[2:])
+	// The hash is stored reversed; Hash() hands it back in digest order.
+	want := bytes.Clone(k[:30])
+	slices.Reverse(want)
+	if !bytes.Equal(k.Hash(), want) {
+		t.Errorf("Hash() = %x, want %x", k.Hash(), want)
 	}
 }
 
 func TestAccessors_MultiByteLength(t *testing.T) {
 	// FileNode, length 65536 (lengthSize 3): header = (1<<4) | (3-1) = 0x12.
 	var k Key
-	k[0] = 0x12
-	k[1], k[2], k[3] = 0x01, 0x00, 0x00 // 0x010000 = 65536
+	k[31] = 0x12
+	k[30], k[29], k[28] = 0x01, 0x00, 0x00 // 0x010000 = 65536, low byte first
 	if k.Type() != FileNode {
 		t.Errorf("Type() = %v, want FileNode", k.Type())
 	}
@@ -73,6 +77,48 @@ func TestNewFromHash_RoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(k.Hash(), full[:Size-1-2]) {
 		t.Errorf("Hash() truncation mismatch")
+	}
+}
+
+func TestNewFromHash_Layout(t *testing.T) {
+	// The key is the (header, big-endian length, hash prefix) encoding with
+	// its 32 bytes reversed: hash first, header last.
+	var full [32]byte
+	for i := range full {
+		full[i] = byte(i + 1)
+	}
+	k, err := NewFromHash(DirNode, 1000, full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unflipped := append([]byte{0x31, 0x03, 0xE8}, full[:29]...) // DirNode, two length bytes, 1000
+	for i, b := range unflipped {
+		if k[Size-1-i] != b {
+			t.Fatalf("k[%d] = %#x, want %#x (key %x)", Size-1-i, k[Size-1-i], b, k[:])
+		}
+	}
+}
+
+func TestNewFromHash_LowEntropyFieldsAtTheEnd(t *testing.T) {
+	// Keys of one type and length differ only in their hash, so they share
+	// their tail (length, header) and spread uniformly on their first byte.
+	const n = 4096
+	first := map[byte]bool{}
+	var tail [2]byte
+	for i := range n {
+		k, err := New(Blob, 200, []byte{byte(i), byte(i >> 8)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first[k[0]] = true
+		if i == 0 {
+			tail = [2]byte(k[Size-2:])
+		} else if [2]byte(k[Size-2:]) != tail {
+			t.Fatalf("key %d: tail %x, want %x", i, k[Size-2:], tail)
+		}
+	}
+	if len(first) != 256 {
+		t.Errorf("%d keys cover %d first-byte values, want all 256", n, len(first))
 	}
 }
 
@@ -143,6 +189,11 @@ func TestNew_KnownAnswerAndTruncation(t *testing.T) {
 	if k != k2 {
 		t.Errorf("New != NewFromHash for the same content")
 	}
+	// The whole key: the 30-byte hash prefix reversed, the length, the header.
+	const wantKey = "1fe4ca939accb712c1adc925cb9b49c9dc36ea4d40a0a6a1f9f5b94913af0000"
+	if got := k.String(); got != wantKey {
+		t.Errorf("New(Blob, 0, nil) = %s, want %s", got, wantKey)
+	}
 }
 
 func TestKey_DeterministicAndComparable(t *testing.T) {
@@ -207,7 +258,7 @@ func TestParse_BadLength(t *testing.T) {
 func TestValidate_ReservedBit(t *testing.T) {
 	var full [32]byte
 	k, _ := NewFromHash(Blob, 1, full)
-	k[0] |= 0x08 // set the reserved bit
+	k[31] |= 0x08 // set the reserved bit
 	if err := k.Validate(); !errors.Is(err, ErrReservedBitSet) {
 		t.Errorf("err = %v, want ErrReservedBitSet", err)
 	}
@@ -215,8 +266,8 @@ func TestValidate_ReservedBit(t *testing.T) {
 
 func TestValidate_ReservedType(t *testing.T) {
 	var k Key
-	k[0] = 6 << 4 // type 6, lengthSize 1
-	k[1] = 0x01
+	k[31] = 6 << 4 // type 6, lengthSize 1
+	k[30] = 0x01
 	if err := k.Validate(); !errors.Is(err, ErrReservedType) {
 		t.Errorf("err = %v, want ErrReservedType", err)
 	}
@@ -226,8 +277,8 @@ func TestValidate_NonCanonicalLength(t *testing.T) {
 	// Blob, lengthSize 2 (header low bits = 1), length bytes 0x00 0x05:
 	// leading zero with a non-zero value -> non-canonical.
 	var k Key
-	k[0] = 0x01
-	k[1], k[2] = 0x00, 0x05
+	k[31] = 0x01
+	k[30], k[29] = 0x00, 0x05
 	if err := k.Validate(); !errors.Is(err, ErrNonCanonicalLength) {
 		t.Errorf("err = %v, want ErrNonCanonicalLength", err)
 	}
@@ -260,8 +311,8 @@ func TestNewFromHash_Commit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if k[0] != 0x50 {
-		t.Errorf("header byte = %#x, want 0x50 (type 5, one length byte)", k[0])
+	if k[31] != 0x50 {
+		t.Errorf("header byte = %#x, want 0x50 (type 5, one length byte)", k[31])
 	}
 	if k.Type() != Commit || k.Length() != 100 {
 		t.Errorf("Type() = %v, Length() = %d; want Commit, 100", k.Type(), k.Length())

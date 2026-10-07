@@ -2,12 +2,14 @@ package packstore
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/amber-store/core/amberpack"
+	"github.com/amber-store/core/key"
 )
 
 // onlyActive returns the path of the directory's single active segment.
@@ -398,5 +400,16 @@ func TestWipeRemovesSidecar(t *testing.T) {
 	}
 	if got := sidecars(t, dir); len(got) != 0 {
 		t.Fatalf("Wipe left %v", got)
+	}
+}
+
+func TestAdvanceRefusesAnotherFormatVersion(t *testing.T) {
+	// A followed segment whose header arrived after the view first saw the
+	// file: a header of another version must not pass for one still missing.
+	body, _ := buildBody(t, testObjects(t, 1))
+	body[len(magicHeader)-1] = 0x01
+	sc := &segmentScan{index: make(map[key.Key]activeLoc)}
+	if _, _, _, err := sc.advance(bytes.NewReader(body), int64(len(body)), nil); !errors.Is(err, ErrUnsupportedVersion) {
+		t.Fatalf("err = %v, want ErrUnsupportedVersion", err)
 	}
 }
