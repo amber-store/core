@@ -91,6 +91,61 @@ format version of its own for segments that hold lz4 records, so that those
 releases refuse the store — as a further change on the same branches, with
 its own design, before they merge.
 
+## The gate: a segment version for lz4
+
+*Added on 2026-10-07; approved by the user the same day, after the correction
+above.*
+
+Releases up to 0.9.0 refuse a segment whose header carries a format version
+other than 2: `Open` fails with an unsupported-version error, a store that is
+already open fails at its next look at the directory, and the file is never
+modified. This was checked by running v0.9.0's own code against segments
+whose header says 3 — a sealed one, and an active one with and without its
+sidecar. The gate uses that.
+
+- **Format.** Segment header version 3 has the layout of version 2. A
+  version-3 segment may hold records of every codec. A version-2 segment
+  holds only codecs 0 and 1.
+- **Reading.** This release reads both versions and refuses every other, as
+  before.
+- **Writing.** A handle creates version-2 segments, unless its
+  `WithCompression` setting is an algorithm beyond zstd, in which case it
+  creates version-3 ones from the start.
+- **The first such record on a version-2 segment.** When a record of codec 2
+  or above is about to be appended to a version-2 active segment, the handle
+  leaves that segment — seals it, or lets go of it if it is empty — and
+  continues in a version-3 one. This holds whatever produced the record: the
+  callback, a pre-encoded record, a compaction copy, a repair. From then on
+  the handle creates version-3 segments, so it pays at most one early seal.
+- **Adoption.** A handle that needs version 3 does not adopt a version-2
+  active segment. A handle that does not need it may adopt either.
+- **No upgrade in place.** A header is never rewritten: a running older
+  process may already have read it.
+- **Repair.** A sealed segment that a repair rewrites keeps its version,
+  raised to 3 when the replacement record is of codec 2 or above.
+- **Scrub.** `Verify` reports a record of codec 2 or above in a version-2
+  segment as corruption.
+- **Wire packs.** Unchanged: older readers already refuse such a record
+  there.
+
+The effect: a store that has ever taken an lz4 record holds a version-3
+segment, and releases up to 0.9.0 refuse that whole store instead of
+misreading it. A store that never sees lz4 stays at version 2 and stays
+readable by them.
+
+Tests, in both languages: every segment stays at version 2 without lz4; an
+lz4 handle writes version 3 from the start; the first lz4 record from a
+callback, from a pre-encoded record and from a compaction copy moves the
+handle to version 3, once; an empty version-2 active segment is let go, not
+rewritten; a handle that needs version 3 leaves a version-2 orphan alone, and
+a handle that does not adopts a version-3 one; a repair raises the version
+only for an lz4 replacement; scrub rejects an lz4 record in a version-2
+segment; a version other than 2 and 3 is still refused. Across languages:
+`vectorgen` writes a version-3 store with lz4 records (`segments_go_lz4`) that
+Rust reads, and the interop script's lz4 stores are version 3. Against the
+old release: v0.9.0 refuses a store this branch wrote with lz4 and reads one
+it wrote with zstd.
+
 ## The compression value
 
 Go, in `amberpack`:
