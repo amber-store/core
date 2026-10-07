@@ -34,7 +34,7 @@ func buildBody(t *testing.T, objs []Object) ([]byte, []recSpan) {
 	body := append([]byte{}, magicHeader...)
 	var spans []recSpan
 	for _, o := range objs {
-		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -135,7 +135,7 @@ func TestScanActiveRefusesAnotherFormatVersion(t *testing.T) {
 	// file holds acknowledged data this release cannot read, and resetting it
 	// would destroy that data.
 	body, _ := buildBody(t, testObjects(t, 2))
-	for _, version := range []byte{0x01, 0x03} {
+	for _, version := range []byte{0x01, 0x04} {
 		old := bytes.Clone(body)
 		old[len(magicHeader)-1] = version
 		if _, err := scanActive(activeFile(t, old)); !errors.Is(err, ErrUnsupportedVersion) {

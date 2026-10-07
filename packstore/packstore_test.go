@@ -19,7 +19,7 @@ import (
 
 func openStore(t *testing.T, dir string, opts ...Option) *Store {
 	t.Helper()
-	s, err := Open(dir, opts...)
+	s, err := Open(dir, append([]Option{WithCompression(zstdDefault)}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestGetRecordRoundTrip(t *testing.T) {
 		}
 	}
 	for _, o := range objs {
-		want, err := amberpack.EncodeRecord(o.Key, o.Data)
+		want, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -128,7 +128,7 @@ func TestStoredSizeMatchesRecordPayload(t *testing.T) {
 		}
 	}
 	for _, o := range objs {
-		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -229,7 +229,7 @@ func TestPutIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+	rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -913,7 +913,7 @@ func TestOpenRefusesStoreOfAnotherFormatVersion(t *testing.T) {
 	} {
 		t.Run(c.suffix, func(t *testing.T) {
 			dir := t.TempDir()
-			s, err := Open(dir, WithSegmentSize(c.segSize), WithSync(false))
+			s, err := Open(dir, WithSegmentSize(c.segSize), WithSync(false), WithCompression(zstdDefault))
 			if err != nil {
 				t.Fatal(err)
 			}

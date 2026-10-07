@@ -134,7 +134,7 @@ func TestSerialWritersFillOneSegment(t *testing.T) {
 	dir := t.TempDir()
 	objs := testObjects(t, 6)
 	for round := range 3 {
-		s, err := Open(dir, WithSync(false))
+		s, err := Open(dir, WithSync(false), WithCompression(zstdDefault))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -209,7 +209,7 @@ func crashSeal(t *testing.T, dir string) {
 func TestAdopterCompletesACrashedSeal(t *testing.T) {
 	dir := t.TempDir()
 	objs := testObjects(t, 5)
-	w, err := Open(dir, WithSync(false))
+	w, err := Open(dir, WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestReaderSeesWhatAnotherWroteAfterItOpened(t *testing.T) {
 func TestReaderHoldsNoLock(t *testing.T) {
 	dir := t.TempDir()
 	objs := testObjects(t, 2)
-	w, err := Open(dir, WithSync(false))
+	w, err := Open(dir, WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func zeroRacyWindow(t *testing.T) {
 func TestMissesDoNotListAnUnchangedDirectory(t *testing.T) {
 	zeroRacyWindow(t)
 	dir := t.TempDir()
-	w, err := Open(dir, WithSync(false), WithSegmentSize(1))
+	w, err := Open(dir, WithSync(false), WithSegmentSize(1), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}

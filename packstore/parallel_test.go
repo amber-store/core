@@ -134,7 +134,7 @@ func TestWriteParallelDedupOnlyRunStillSyncs(t *testing.T) {
 	objs := testObjects(t, 4)
 	// Stand in for a concurrent, not-yet-committed writer.
 	for _, o := range objs {
-		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}

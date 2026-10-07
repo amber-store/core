@@ -258,7 +258,7 @@ func parseFooter(mm []byte) (*footerView, error) {
 	if err := checkVersion(mm); err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(mm[:len(magicHeader)], magicHeader) {
+	if !isHeader(mm[:len(magicHeader)]) {
 		return nil, fmt.Errorf("%w: bad header magic", ErrCorrupt)
 	}
 	tr := mm[len(mm)-trailerSize:]
@@ -361,6 +361,9 @@ func openSealed(path string, id uint64) (*sealedSegment, error) {
 func (g *sealedSegment) close() error {
 	return unix.Munmap(g.mm)
 }
+
+// version returns the segment's format version.
+func (g *sealedSegment) version() byte { return g.mm[len(magicHeader)-1] }
 
 // has reports whether k is in this segment: fuse filter first (cheap,
 // probabilistic), then the exact index.

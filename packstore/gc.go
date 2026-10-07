@@ -188,7 +188,7 @@ func (s *Store) AppendRecord(k key.Key, raw []byte) error {
 		return gerr
 	}
 	defer s.endWrite(w)
-	rec, _, err := prepare(Object{Key: k, Record: raw}, false)
+	rec, _, err := s.prepare(Object{Key: k, Record: raw}, false)
 	if err != nil {
 		return err
 	}

@@ -438,7 +438,7 @@ func writeSealedFile(t *testing.T, objs []Object) (string, []indexEntry) {
 	body = append(body, magicHeader...)
 	var entries []indexEntry
 	for _, o := range objs {
-		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 		if err != nil {
 			t.Fatal(err)
 		}

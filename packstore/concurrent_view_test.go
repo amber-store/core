@@ -115,7 +115,7 @@ func TestLookupsDuringTheFirstWriteSeeNoError(t *testing.T) {
 	absent := blobObj(t, []byte("nobody stored this"))
 	for round := range 40 {
 		dir := t.TempDir()
-		w, err := Open(dir, WithSync(false))
+		w, err := Open(dir, WithSync(false), WithCompression(zstdDefault))
 		if err != nil {
 			t.Fatal(err)
 		}

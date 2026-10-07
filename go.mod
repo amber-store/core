@@ -9,6 +9,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/klauspost/compress v1.17.11
+	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/urfave/cli/v2 v2.27.7
 	github.com/zeebo/blake3 v0.2.4
 	golang.org/x/sync v0.22.0

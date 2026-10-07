@@ -97,6 +97,24 @@ root, stats, _ := ingest.Dir(objects, "./some/dir", ingest.Opts{})
 _ = tarexport.Write(w, root, objects.Get)
 ```
 
+Objects are stored uncompressed unless the store is opened with a compression
+option:
+
+```go
+objects, _ := packstore.Open(filepath.Join(dir, "packstore"),
+	packstore.WithCompression(amberpack.Compression{Algorithm: amberpack.Zstd}))
+```
+
+`WithCompression` takes none, zstd (levels 1–22) or lz4 (0 for the fast
+compressor, 1–12 for high compression); level 0 is each algorithm's default.
+`WithCompressionFor` adds a function that chooses per object, from its key and
+bytes. Every store reads records of every codec, whatever it was opened with,
+and existing records are never recompressed. Releases before this one read raw
+and zstd records only. A store written to with lz4 holds segments at a format
+version they refuse, so they cannot open that store at all; one that never is
+stays readable by them. See
+[architecture/amberpack.md](architecture/amberpack.md).
+
 ## The CLI
 
 Every command operates directly on the store directory given by `--store` or
@@ -107,6 +125,14 @@ single-file root is the file's content key:
 ```sh
 amber-store --store ./store ingest ./some/dir           # print the root key
 amber-store --store ./store ingest --ref backups/home ./some/dir  # also name it
+```
+
+New objects are stored uncompressed by default. The global flag
+`--compression none|zstd[:LEVEL]|lz4[:LEVEL]`, given before the command, sets
+the compression for what that command writes:
+
+```sh
+amber-store --store ./store --compression zstd:19 ingest ./some/dir
 ```
 
 Inspect and export by key or reference, optionally addressing a subdirectory

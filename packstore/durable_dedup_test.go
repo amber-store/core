@@ -57,7 +57,7 @@ func TestCompactDoesNotLeaveTheOnlyCopyUnsynced(t *testing.T) {
 	putAll(t, openStore(t, dir, WithSync(false)), []Object{kept}) // a live writer that never syncs
 
 	s := openStore(t, dir, WithSegmentSize(8<<10)) // syncs
-	rec, err := amberpack.EncodeRecord(kept.Key, kept.Data)
+	rec, err := amberpack.EncodeRecordWith(kept.Key, kept.Data, zstdDefault)
 	if err != nil {
 		t.Fatal(err)
 	}

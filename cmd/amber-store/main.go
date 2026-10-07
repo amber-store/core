@@ -35,6 +35,11 @@ func newApp() *cli.App {
 				Usage: "pack segment size in bytes; the reaping granularity",
 				Value: packstore.DefaultSegmentSize,
 			},
+			&cli.StringFlag{
+				Name:  "compression",
+				Usage: "compression for the objects this command writes: none, zstd[:LEVEL] or lz4[:LEVEL]",
+				Value: "none",
+			},
 		},
 		Commands: []*cli.Command{
 			ingestCommand(),

@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -680,5 +681,119 @@ func TestE2E_RefExpect(t *testing.T) {
 	}
 	if _, err := ref("set", "--expect", root1, "gone", root1); err == nil {
 		t.Fatal("--expect KEY created a reference that did not exist")
+	}
+}
+
+// dirSize returns the total size of the regular files under dir.
+func dirSize(t *testing.T, dir string) int64 {
+	t.Helper()
+	var n int64
+	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		info, err := d.Info()
+		n += info.Size()
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestE2E_Compression(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	// Numbered lines: they compress well, and unlike one repeated line they
+	// do not chunk into identical pieces that dedup away.
+	var numbered bytes.Buffer
+	for i := range 4000 {
+		fmt.Fprintf(&numbered, "line %06d of the compression test\n", i)
+	}
+	text := numbered.Bytes() // ~140 KiB
+	if err := os.WriteFile(filepath.Join(src, "big.txt"), text, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sizes := map[string]int64{}
+	for _, comp := range []string{"none", "zstd:19", "lz4:9"} {
+		store := t.TempDir()
+		if _, err := runApp(t, "--store", store, "--compression", comp, "ingest", "--no-progress", "--ref", "v1", src); err != nil {
+			t.Fatalf("%s: ingest: %v", comp, err)
+		}
+		// Read back without the flag: reading never depends on the setting.
+		dest := t.TempDir()
+		if _, err := runApp(t, "--store", store, "restore", "ref:v1", dest); err != nil {
+			t.Fatalf("%s: restore: %v", comp, err)
+		}
+		got, err := os.ReadFile(filepath.Join(dest, "big.txt"))
+		if err != nil || !bytes.Equal(got, text) {
+			t.Fatalf("%s: restored big.txt: %d bytes, %v", comp, len(got), err)
+		}
+		sizes[comp] = dirSize(t, filepath.Join(store, "packstore"))
+	}
+	if sizes["none"] < int64(len(text)) {
+		t.Errorf("the default store is %d bytes, smaller than the %d-byte file: something compressed it", sizes["none"], len(text))
+	}
+	for _, comp := range []string{"zstd:19", "lz4:9"} {
+		if sizes[comp] >= sizes["none"]/2 {
+			t.Errorf("--compression %s: packstore is %d bytes, the uncompressed one %d", comp, sizes[comp], sizes["none"])
+		}
+	}
+}
+
+func TestE2E_CompressionRejectsBadValues(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	store := t.TempDir()
+	for _, bad := range []string{"gzip", "zstd:23", "zstd:", "lz4:x", "ZSTD", ""} {
+		_, err := runApp(t, "--store", store, "--compression", bad, "ingest", "--no-progress", src)
+		if err == nil || !strings.Contains(err.Error(), "invalid compression") {
+			t.Errorf("--compression %q: err = %v, want an invalid compression error", bad, err)
+		}
+	}
+	if entries, _ := os.ReadDir(store); len(entries) != 0 {
+		t.Errorf("a rejected --compression still created %d entries in the store", len(entries))
+	}
+}
+
+// TestE2E_GCOverMixedCodecs runs a collection over a store that one ingest
+// wrote with lz4 and the next with zstd: the tree that stays live holds
+// records of both, and restores after the cycle.
+func TestE2E_GCOverMixedCodecs(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	keep := []byte(strings.Repeat("kept across both ingests\n", 3000))
+	if err := os.WriteFile(filepath.Join(src, "keep.txt"), keep, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "big.txt"), []byte(strings.Repeat("first version\n", 3000)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := t.TempDir()
+	seg := []string{"--store", store, "--segment-size", "4096"}
+	if _, err := runApp(t, append(seg, "--compression", "lz4", "ingest", "--no-progress", "--ref", "v1", src)...); err != nil {
+		t.Fatalf("first ingest: %v", err)
+	}
+	second := []byte(strings.Repeat("second version\n", 3000))
+	if err := os.WriteFile(filepath.Join(src, "big.txt"), second, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runApp(t, append(seg, "--compression", "zstd:19", "ingest", "--no-progress", "--ref", "v1", src)...); err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := runApp(t, append(seg, "gc", "run", "--grace", "1ms", "--garbage", "0")...); err != nil {
+		t.Fatalf("gc run: %v", err)
+	}
+	dest := t.TempDir()
+	if _, err := runApp(t, append(seg, "restore", "ref:v1", dest)...); err != nil {
+		t.Fatalf("restore after gc: %v", err)
+	}
+	for name, want := range map[string][]byte{"keep.txt": keep, "big.txt": second} {
+		got, err := os.ReadFile(filepath.Join(dest, name))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%s after gc: %d bytes, %v", name, len(got), err)
+		}
 	}
 }

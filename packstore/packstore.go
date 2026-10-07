@@ -39,8 +39,10 @@ const (
 type Option func(*config)
 
 type config struct {
-	segmentSize int64
-	sync        bool
+	segmentSize    int64
+	sync           bool
+	compression    amberpack.Compression
+	compressionFor CompressionFunc
 }
 
 func defaultConfig() config {
@@ -62,11 +64,12 @@ func WithSync(b bool) Option {
 // activeSegment is the append-only segment this store owns and writes to.
 // Other stores on the directory own theirs (active.go).
 type activeSegment struct {
-	id    uint64
-	path  string
-	f     *os.File
-	size  int64 // accessed only under appendMu
-	index map[key.Key]activeLoc
+	id      uint64
+	path    string
+	version byte // the header's format version: which records it may hold
+	f       *os.File
+	size    int64 // accessed only under appendMu
+	index   map[key.Key]activeLoc
 	// sc mirrors index on disk (sidecar.go), so that the next open does not
 	// have to scan the data. Nil when it could not be written. Under appendMu.
 	sc *sidecarWriter
@@ -102,8 +105,13 @@ type Store struct {
 	// nothing skip the next listing (viewIsCurrent). Guarded by mu.
 	dirMtime, listedAt time.Time
 	nextID             uint64 // a floor for new segment ids; under appendMu
-	closed             bool
-	failed             error // sticky write-path failure; written under appendMu+mu, read under either
+	// segVersion is the format version this store creates active segments
+	// at, and the lowest at which it adopts one. It starts from the
+	// compression option and is raised for good by the first record that
+	// needs more. Under appendMu.
+	segVersion byte
+	closed     bool
+	failed     error // sticky write-path failure; written under appendMu+mu, read under either
 
 	// scrubMu/scrubN/scrubC track in-flight lock-free mmap walks (Verify,
 	// ScanIndex, Record): Close/Wipe/Remove wait for scrubN to reach 0 before
@@ -189,6 +197,9 @@ func Open(dir string, opts ...Option) (*Store, error) {
 	for _, o := range opts {
 		o(&cfg)
 	}
+	if err := cfg.compression.Validate(); err != nil {
+		return nil, fmt.Errorf("packstore: %w", err)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("packstore: creating %s: %w", dir, err)
 	}
@@ -201,6 +212,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("packstore: %s is held by an older release, which needs the store to itself: %w", dir, err)
 	}
 	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1, writes: make(map[*writeToken]time.Time)}
+	s.segVersion = versionFor(byte(cfg.compression.Algorithm))
 	s.scrubC = sync.NewCond(&s.scrubMu)
 	if s.gate, err = openGate(dir, s.refresh); err != nil {
 		dirF.Close()
@@ -256,22 +268,41 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	if s.failed != nil {
 		return s.failed
 	}
-	if err := s.ensureActiveLocked(); err != nil {
-		return err
-	}
-	a := s.active
-	if _, ok := a.index[k]; ok {
-		// Lost a Put race for this key; the record is already appended. The
-		// winner may have been a deferred put, which has not synced it.
-		if syncNow && s.cfg.sync && s.deferred.Load() {
-			if err := a.f.Sync(); err != nil {
-				s.setFailed(err)
-				return err
-			}
-			a.sc.synced(a.size)
-			s.deferred.Store(false)
+	// An lz4 record goes into a segment at versionLZ4 only, and a store that
+	// has written one stays at that version: it leaves a segment early once,
+	// not once per segment.
+	need := versionFor(rec[33])
+	s.segVersion = max(s.segVersion, need)
+	var a *activeSegment
+	for {
+		if err := s.ensureActiveLocked(); err != nil {
+			return err
 		}
-		return nil
+		a = s.active
+		if _, ok := a.index[k]; ok {
+			// Lost a Put race for this key, or took over a segment that
+			// holds it: the record is already appended. Whoever appended it
+			// may have been a deferred put, which has not synced it.
+			if syncNow && s.cfg.sync && s.deferred.Load() {
+				if err := a.f.Sync(); err != nil {
+					s.setFailed(err)
+					return err
+				}
+				a.sc.synced(a.size)
+				s.deferred.Store(false)
+			}
+			return nil
+		}
+		if a.version >= need {
+			break
+		}
+		// The segment this store holds may not take the record. Its header
+		// is never rewritten: an older release that has read it would go on
+		// to misread what follows. The segment taken instead is checked for
+		// the key like any other: it may be one somebody left behind.
+		if err := s.leaveActiveLocked(); err != nil {
+			return err
+		}
 	}
 	off := a.size
 	if _, err := a.f.WriteAt(rec, off); err != nil {
@@ -463,7 +494,7 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 		if has {
 			continue
 		}
-		rec, _, err := prepare(obj, false)
+		rec, _, err := s.prepare(obj, false)
 		if err != nil {
 			return fail(err)
 		}
@@ -505,7 +536,7 @@ func (s *Store) Put(k key.Key, data []byte) error {
 		}
 		return nil
 	}
-	rec, err := amberpack.EncodeRecord(k, data)
+	rec, err := s.encode(k, data)
 	if err != nil {
 		return err
 	}
@@ -593,7 +624,7 @@ func (s *Store) get(k key.Key) ([]byte, error) {
 
 // GetRecord returns a caller-owned copy of the full on-disk record stored under
 // k — its 46-byte header plus the stored (still-compressed) payload, exactly as
-// written by amberpack.EncodeRecord — or ErrNotFound if k is absent. This is the
+// written by amberpack.EncodeRecordWith — or ErrNotFound if k is absent. This is the
 // zero-copy push path: the record is wire-format-identical, so a caller can hand
 // it to amberpack.Writer.AddRecord without decompressing and re-encoding. Like
 // Get, it does not CRC-check; the receiving Reader validates framing and CRC.

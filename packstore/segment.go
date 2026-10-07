@@ -27,8 +27,21 @@ const (
 	tagDelete byte = 0x02 // reserved for v2 GC; never written in v1
 )
 
+// Segment format versions: the last byte of a segment's header. The two have
+// the same layout; the version says which codecs the segment's records may
+// use. A segment at versionBase holds only raw and zstd records, which is all
+// that releases up to 0.9.0 read. Those releases refuse a segment at any
+// other version, and would misread an lz4 record in one they accept, so an
+// lz4 record is only ever written to a segment at versionLZ4. A later codec
+// takes a later version in the same way: a release must refuse the segments
+// whose records it cannot read (architecture/packstore.md).
+const (
+	versionBase byte = 2
+	versionLZ4  byte = 3
+)
+
 var (
-	magicHeader  = []byte("AMBERSG\x02") // the last byte is the format version
+	magicHeader  = []byte("AMBERSG\x02") // a header at versionBase; the last byte is the format version
 	magicTrailer = []byte("AMBERSGF")
 	castagnoli   = crc32.MakeTable(crc32.Castagnoli) // footer CRC; record CRC lives in amberpack
 )
@@ -48,15 +61,40 @@ var ErrUnsupportedVersion = errors.New("packstore: unsupported segment format ve
 // foreign header is the caller's to judge.
 func checkVersion(b []byte) error {
 	n := len(magicHeader) - 1
-	if len(b) <= n || !bytes.Equal(b[:n], magicHeader[:n]) || b[n] == magicHeader[n] {
+	if len(b) <= n || !bytes.Equal(b[:n], magicHeader[:n]) || readsVersion(b[n]) {
 		return nil
 	}
-	return fmt.Errorf("%w: %d, this release reads %d", ErrUnsupportedVersion, b[n], magicHeader[n])
+	return fmt.Errorf("%w: %d, this release reads %d and %d", ErrUnsupportedVersion, b[n], versionBase, versionLZ4)
+}
+
+func readsVersion(v byte) bool { return v == versionBase || v == versionLZ4 }
+
+// isHeader reports whether b is a segment header of a version this release
+// reads.
+func isHeader(b []byte) bool {
+	n := len(magicHeader) - 1
+	return len(b) == len(magicHeader) && bytes.Equal(b[:n], magicHeader[:n]) && readsVersion(b[n])
+}
+
+// headerAt returns the segment header for a format version.
+func headerAt(version byte) []byte {
+	h := bytes.Clone(magicHeader)
+	h[len(h)-1] = version
+	return h
+}
+
+// versionFor returns the lowest segment version that may hold a record with
+// the given flags byte.
+func versionFor(flags byte) byte {
+	if amberpack.Algorithm(flags) > amberpack.Zstd {
+		return versionLZ4
+	}
+	return versionBase
 }
 
 // Object is one CAS object to store: its key and either its serialized
 // bytes (Data) or, for an object that was encoded elsewhere, the complete
-// record as amberpack.EncodeRecord produced it (Record). Exactly one of
+// record as amberpack.EncodeRecordWith produced it (Record). Exactly one of
 // the two is set. A Record is parsed (framing, CRC, canonical key, key
 // equal to Key) and appended verbatim, so a caller that already holds
 // encoded records, say a pack it staged on disk, skips the compression

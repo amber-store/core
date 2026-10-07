@@ -15,7 +15,7 @@ import (
 
 func repairStore(t *testing.T, opts ...Option) *Store {
 	t.Helper()
-	s, err := Open(t.TempDir(), opts...)
+	s, err := Open(t.TempDir(), append([]Option{WithCompression(zstdDefault)}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestPutVerifiedRepairsAndReopens(t *testing.T) {
 				if err := s.Close(); err != nil {
 					t.Fatal(err)
 				}
-				reopened, err := Open(dir)
+				reopened, err := Open(dir, WithCompression(zstdDefault))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -93,7 +93,7 @@ func TestPutVerifiedRepairsAndReopens(t *testing.T) {
 func TestPutVerifiedAllCopiesAndReaderLifetime(t *testing.T) {
 	s := repairStore(t, WithSegmentSize(1))
 	o := blobObj(t, []byte("duplicate value"))
-	raw, err := amberpack.EncodeRecord(o.Key, o.Data)
+	raw, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestRecoverFooterBeforeDamagedBody(t *testing.T) {
 	if err := os.Rename(path, path+".active"); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(dir)
+	reopened, err := Open(dir, WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -479,7 +479,7 @@ func TestAppendSyncsARecordADeferredPutLeftBehind(t *testing.T) {
 	if n := syncedLen(t, s); n >= s.active.size {
 		t.Fatalf("the sidecar knows %d of %d bytes synced before anything synced the deferred record", n, s.active.size)
 	}
-	rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+	rec, err := amberpack.EncodeRecordWith(o.Key, o.Data, zstdDefault)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -16,7 +16,7 @@ import (
 // segments and objs[4] in the active one.
 func compactStore(t *testing.T) (*Store, []Object) {
 	t.Helper()
-	s, err := Open(t.TempDir(), WithSegmentSize(8<<10), WithSync(false))
+	s, err := Open(t.TempDir(), WithSegmentSize(8<<10), WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestCompactRemovesDeadObjects(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s2, err := Open(dir, WithSync(false))
+	s2, err := Open(dir, WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestCompactHorizonSparesYoungSegments(t *testing.T) {
 
 func TestCompactRejectsCorruptRecord(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(dir, WithSegmentSize(8<<10), WithSync(false))
+	s, err := Open(dir, WithSegmentSize(8<<10), WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestCompactRejectsCorruptRecord(t *testing.T) {
 	if err := os.WriteFile(segs[0], raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	s, err = Open(dir, WithSync(false))
+	s, err = Open(dir, WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		t.Fatal(err)
 	}

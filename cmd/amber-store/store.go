@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/gc"
 	"github.com/amber-store/core/packstore"
 	"github.com/amber-store/core/refstore"
@@ -20,8 +21,13 @@ func openStore(c *cli.Context) (*packstore.Store, *refstore.Store, error) {
 	if dir == "" {
 		return nil, nil, fmt.Errorf("no store directory: set --store or $AMBER_STORE")
 	}
+	compression, err := amberpack.ParseCompression(c.String("compression"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("--compression: %w", err)
+	}
 	objects, err := packstore.Open(filepath.Join(dir, "packstore"),
-		packstore.WithSync(true), packstore.WithSegmentSize(c.Int64("segment-size")))
+		packstore.WithSync(true), packstore.WithSegmentSize(c.Int64("segment-size")),
+		packstore.WithCompression(compression))
 	if err != nil {
 		return nil, nil, err
 	}

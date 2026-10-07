@@ -7,20 +7,20 @@ import (
 )
 
 // prepare returns the record to append for obj and the payload length the
-// write stats charge for it. For Data that is EncodeRecord's output after
-// the optional verification; for a pre-encoded Record it is the record
+// write stats charge for it. For Data that is the store's encoding (encode)
+// after the optional verification; for a pre-encoded Record it is the record
 // itself, after ParseRecord (framing, flags, length invariants, CRC,
 // canonical key), a check that the record names obj.Key and is exactly one
 // record long, and, with verify, a decode and rehash of the payload. Every
 // rejection of a Record wraps ErrCorrupt, a verification failure ErrVerify.
-func prepare(obj Object, verify bool) ([]byte, int64, error) {
+func (s *Store) prepare(obj Object, verify bool) ([]byte, int64, error) {
 	if obj.Record == nil {
 		if verify {
 			if err := verifyObject(obj); err != nil {
 				return nil, 0, err
 			}
 		}
-		rec, err := amberpack.EncodeRecord(obj.Key, obj.Data)
+		rec, err := s.encode(obj.Key, obj.Data)
 		if err != nil {
 			return nil, 0, err
 		}

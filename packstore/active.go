@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -74,7 +75,7 @@ func (s *Store) ensureActiveLocked() error {
 		return strings.Compare(a.path, b.path)
 	})
 	for _, sf := range cands {
-		adopted, err := s.adopt(ids[sf.path], sf.path)
+		adopted, err := s.adopt(ids[sf.path], sf.path, s.segVersion)
 		if err != nil {
 			return err
 		}
@@ -86,9 +87,10 @@ func (s *Store) ensureActiveLocked() error {
 }
 
 // adopt tries to take the active segment at path. It reports false when
-// somebody else holds it, when it is gone, or when it turned out to be a
-// crashed seal, which is finished here and leaves nothing to append to.
-func (s *Store) adopt(id uint64, path string) (bool, error) {
+// somebody else holds it, when it is gone, when its format version is below
+// minVersion, or when it turned out to be a crashed seal, which is finished
+// here and leaves nothing to append to.
+func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
@@ -99,6 +101,20 @@ func (s *Store) adopt(id uint64, path string) (bool, error) {
 	if ok, err := tryLock(f); err != nil || !ok || !isFileAt(f, path) {
 		f.Close()
 		return false, err
+	}
+	// A segment below the version this store writes at is left as it is, for
+	// a writer that can use it. One whose header never arrived is taken: it
+	// gets this store's.
+	header := make([]byte, len(magicHeader))
+	n, err := f.ReadAt(header, 0)
+	if err != nil && !errors.Is(err, io.EOF) { // short is fine: the header never arrived
+		f.Close()
+		return false, err
+	}
+	hasHeader := n == len(header) && isHeader(header)
+	if hasHeader && header[len(header)-1] < minVersion {
+		f.Close()
+		return false, nil
 	}
 	// The segment is this store's now: only from here on may it be modified.
 	res, err := recoverSegment(path)
@@ -134,13 +150,21 @@ func (s *Store) adopt(id uint64, path string) (bool, error) {
 		return false, nil
 	}
 	size := res.dataEnd
+	version := header[len(header)-1]
+	if size >= int64(len(magicHeader)) && !hasHeader {
+		// Recovery found records behind something that is not a header this
+		// release reads: it cannot have, and nothing may be appended here.
+		f.Close()
+		return false, fmt.Errorf("%w: %s: records behind an unreadable header", ErrCorrupt, path)
+	}
 	if size < int64(len(magicHeader)) {
 		// The header never became durable, so nothing in the file was ever
 		// acknowledged: start it over. Deliberate and silent.
 		res.sidecarEnd, res.missing = 0, nil
+		version = s.segVersion
 		err = f.Truncate(0)
 		if err == nil {
-			_, err = f.WriteAt(magicHeader, 0)
+			_, err = f.WriteAt(headerAt(version), 0)
 		}
 		size = int64(len(magicHeader))
 	} else {
@@ -150,7 +174,7 @@ func (s *Store) adopt(id uint64, path string) (bool, error) {
 		f.Close()
 		return false, err
 	}
-	a := &activeSegment{id: id, path: path, f: f, size: size, index: res.index, sc: openOwnedSidecar(path, res)}
+	a := &activeSegment{id: id, path: path, version: version, f: f, size: size, index: res.index, sc: openOwnedSidecar(path, res)}
 	s.mu.Lock()
 	s.structEpoch++
 	s.dropForeignLocked(id)
@@ -199,7 +223,7 @@ func (s *Store) createActive(maxID uint64) error {
 			}
 			continue
 		}
-		if _, err = f.WriteAt(magicHeader, 0); err == nil {
+		if _, err = f.WriteAt(headerAt(s.segVersion), 0); err == nil {
 			err = f.Sync()
 		}
 		if err == nil {
@@ -214,7 +238,7 @@ func (s *Store) createActive(maxID uint64) error {
 			return err
 		}
 		sc, _ := createSidecar(final + sidecarSuffix) // nil on failure: a segment works without one
-		a := &activeSegment{id: id, path: final, f: f, size: int64(len(magicHeader)), index: make(map[key.Key]activeLoc), sc: sc}
+		a := &activeSegment{id: id, path: final, version: s.segVersion, f: f, size: int64(len(magicHeader)), index: make(map[key.Key]activeLoc), sc: sc}
 		s.nextID = id + 1
 		s.mu.Lock()
 		s.structEpoch++
@@ -287,25 +311,45 @@ func (s *Store) lockForeign(foreign []*foreignActive) ([]*os.File, error) {
 	return held, nil
 }
 
+// releaseActiveLocked lets go of the store's active segment as it is: it
+// stays on disk, unsealed, for whoever writes next. Called under appendMu.
+func (s *Store) releaseActiveLocked() {
+	a := s.active
+	a.sc.close()
+	a.f.Close()
+	s.mu.Lock()
+	s.structEpoch++
+	s.active = nil
+	// The segment is now neither this store's nor in its view of the
+	// others', and whoever takes it next changes nothing in the directory:
+	// the next lookup that misses has to list it.
+	s.dirMtime = time.Time{}
+	s.mu.Unlock()
+}
+
+// leaveActiveLocked gives up the store's active segment so that the next
+// append takes another: it seals the segment, or, when nothing is in it yet,
+// lets go of it. Called under appendMu.
+func (s *Store) leaveActiveLocked() error {
+	if err := s.sealActiveLocked(); err != nil {
+		return err
+	}
+	if s.active != nil { // empty: sealing left it alone
+		s.releaseActiveLocked()
+	}
+	return nil
+}
+
 // sealIdleLocked seals every active segment that no writer holds. A small
 // store's segments never fill, and the process that wrote them may be long
 // gone: without this nothing in them could ever be collected. A segment a
 // live writer holds is left alone; an active segment is never a victim.
 // Called by Compact under appendMu, after it sealed the store's own segment.
 func (s *Store) sealIdleLocked() error {
-	if a := s.active; a != nil {
+	if s.active != nil {
 		// Still owned, so empty: sealing left it alone. Let go of it for the
 		// pass; it is on disk for whoever writes next.
-		a.sc.close()
-		a.f.Close()
-		s.mu.Lock()
-		s.structEpoch++
-		s.active = nil
-		// The segment is now neither this store's nor in its view of the
-		// others', and whoever takes it next changes nothing in the
-		// directory: the next lookup that misses has to list it.
-		s.dirMtime = time.Time{}
-		s.mu.Unlock()
+		s.releaseActiveLocked()
 	}
 	ls, err := listSegments(s.dir)
 	if err != nil {
@@ -319,7 +363,7 @@ func (s *Store) sealIdleLocked() error {
 		return cmp.Or(cmp.Compare(ls.active[b].info.Size(), ls.active[a].info.Size()), cmp.Compare(a, b))
 	})
 	for _, id := range ids {
-		adopted, err := s.adopt(id, ls.active[id].path)
+		adopted, err := s.adopt(id, ls.active[id].path, versionBase) // whatever its version: it is to be sealed
 		if err != nil {
 			return err
 		}

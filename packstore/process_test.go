@@ -29,7 +29,7 @@ func TestMain(m *testing.M) {
 }
 
 func childProcess(dir string) error {
-	s, err := Open(dir, WithSync(false))
+	s, err := Open(dir, WithSync(false), WithCompression(zstdDefault))
 	if err != nil {
 		return err
 	}
