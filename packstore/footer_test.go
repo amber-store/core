@@ -255,10 +255,13 @@ func TestFilterSectionFalsePositiveRate(t *testing.T) {
 	}
 }
 
-func TestFilterSectionDuplicateTails(t *testing.T) {
-	// Two entries with an identical 8-byte tail must not break the build.
+func TestFilterSectionDuplicateHeads(t *testing.T) {
+	// Two entries with an identical 8-byte head must not break the build.
 	entries := testEntries(t, 2)
-	copy(entries[1].k[24:32], entries[0].k[24:32])
+	copy(entries[1].k[:8], entries[0].k[:8])
+	if filterKey(entries[0].k) != filterKey(entries[1].k) {
+		t.Fatal("the two keys do not share their filter input")
+	}
 	sec, err := buildFilterSection(entries)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +271,7 @@ func TestFilterSectionDuplicateTails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !f.Contains(filterKey(entries[0].k)) || !f.Contains(filterKey(entries[1].k)) {
-		t.Fatal("false negative on duplicate tails")
+		t.Fatal("false negative on duplicate heads")
 	}
 }
 
@@ -399,13 +402,13 @@ func TestParseFilterSectionRejectsBadGeometry(t *testing.T) {
 
 func TestFilterSectionFieldRoundTrip(t *testing.T) {
 	entries := testEntries(t, 1234)
-	tails := make([]uint64, 0, len(entries))
+	heads := make([]uint64, 0, len(entries))
 	for _, e := range entries {
-		tails = append(tails, filterKey(e.k))
+		heads = append(heads, filterKey(e.k))
 	}
-	slices.Sort(tails)
-	tails = slices.Compact(tails)
-	want, err := xorfilter.NewBinaryFuse[uint16](tails)
+	slices.Sort(heads)
+	heads = slices.Compact(heads)
+	want, err := xorfilter.NewBinaryFuse[uint16](heads)
 	if err != nil {
 		t.Fatal(err)
 	}
