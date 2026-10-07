@@ -6,12 +6,12 @@
 // pack) carrying no root key. Layout:
 //
 //	Magic    "AMBERPK\x04"   8 bytes  (plaintext)
-//	Records  repeat: one EncodeRecord output each — a 46-byte header
+//	Records  repeat: one EncodeRecordWith output each — a 46-byte header
 //	         (tag 0x01 + key[32] + flags + ulen + slen + CRC) followed by the payload
 //	End      0x00
 //
-// Each record is the same self-describing, CRC-protected, individually compressed unit
-// packstore writes on disk (see record.go); a wire pack is just those records
+// Each record is the same self-describing, CRC-protected, individually
+// compressed unit packstore writes on disk (see record.go); a wire pack is just those records
 // framed by a magic and an explicit end marker, so a truncated stream is
 // detected rather than read as a clean EOF. The Reader validates framing, CRC,
 // and key canonicality and decodes each payload (All), or hands the validated
@@ -52,12 +52,27 @@ var ErrMalformed = errors.New("amberpack: malformed pack stream")
 type Writer struct {
 	bw          *bufio.Writer
 	wroteHeader bool
+	compression Compression
+}
+
+// WriterOption configures a Writer.
+type WriterOption func(*Writer)
+
+// WithCompression sets the compression Add encodes with. The default is no
+// compression. An invalid value fails every Add with an error wrapping
+// ErrInvalidCompression. AddRecord is unaffected: it writes records as given.
+func WithCompression(c Compression) WriterOption {
+	return func(w *Writer) { w.compression = c }
 }
 
 // NewWriter returns a Writer emitting to w. The caller owns w and must close it;
 // Writer.Close only writes the end marker and flushes.
-func NewWriter(w io.Writer) *Writer {
-	return &Writer{bw: bufio.NewWriter(w)}
+func NewWriter(w io.Writer, opts ...WriterOption) *Writer {
+	pw := &Writer{bw: bufio.NewWriter(w)}
+	for _, o := range opts {
+		o(pw)
+	}
+	return pw
 }
 
 func (w *Writer) ensureHeader() error {
@@ -76,7 +91,7 @@ func (w *Writer) Add(o fstree.Object) error {
 	if err := w.ensureHeader(); err != nil {
 		return err
 	}
-	rec, err := EncodeRecord(o.Key, o.Bytes)
+	rec, err := EncodeRecordWith(o.Key, o.Bytes, w.compression)
 	if err != nil {
 		return err
 	}

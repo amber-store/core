@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -79,7 +81,7 @@ func TestRoundTrip_Compressed(t *testing.T) {
 		mkObj(t, big),
 	}
 	var buf bytes.Buffer
-	w := NewWriter(&buf)
+	w := NewWriter(&buf, WithCompression(zstdDefault))
 	for _, o := range objs {
 		if err := w.Add(o); err != nil {
 			t.Fatalf("Add: %v", err)
@@ -120,7 +122,7 @@ func TestWriter_AddRecord_RoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	w := NewWriter(&buf)
 	for _, o := range objs {
-		rec, err := EncodeRecord(o.Key, o.Bytes)
+		rec, err := EncodeRecordWith(o.Key, o.Bytes, zstdDefault)
 		if err != nil {
 			t.Fatalf("EncodeRecord: %v", err)
 		}
@@ -300,10 +302,10 @@ func TestReader_Records_RoundTrip(t *testing.T) {
 		mkObj(t, incompressible(4000)),
 	}
 	var buf bytes.Buffer
-	w := NewWriter(&buf)
+	w := NewWriter(&buf, WithCompression(zstdDefault))
 	want := make([][]byte, len(objs))
 	for i, o := range objs {
-		rec, err := EncodeRecord(o.Key, o.Bytes)
+		rec, err := EncodeRecordWith(o.Key, o.Bytes, zstdDefault)
 		if err != nil {
 			t.Fatalf("EncodeRecord: %v", err)
 		}
@@ -388,5 +390,103 @@ func TestReader_Records_CRCMismatch(t *testing.T) {
 	body := append(rec, tagEnd)
 	if _, err := collectRecords(t, NewReader(bytes.NewReader(wirePack(body)))); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("err = %v, want ErrMalformed (record CRC mismatch)", err)
+	}
+}
+
+// packCodecs returns the codec id of every record in a wire pack, in order.
+func packCodecs(t *testing.T, pack []byte) []Algorithm {
+	t.Helper()
+	var out []Algorithm
+	for rec, err := range NewReader(bytes.NewReader(pack)).Records() {
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, Algorithm(rec.Flags))
+	}
+	return out
+}
+
+func TestWriterStoresRawByDefault(t *testing.T) {
+	big := mkObj(t, bytes.Repeat([]byte("amber"), 50_000))
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	if err := w.Add(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := packCodecs(t, buf.Bytes()); len(got) != 1 || got[0] != None {
+		t.Fatalf("codecs = %v, want [none]", got)
+	}
+	if buf.Len() < len(big.Bytes) {
+		t.Fatalf("pack of %d bytes is smaller than its %d-byte raw payload", buf.Len(), len(big.Bytes))
+	}
+}
+
+func TestWriterWithCompression(t *testing.T) {
+	big := mkObj(t, bytes.Repeat([]byte("amber"), 50_000))
+	for _, c := range []Compression{{Zstd, 0}, {Zstd, 19}, {LZ4, 0}, {LZ4, 9}} {
+		var buf bytes.Buffer
+		w := NewWriter(&buf, WithCompression(c))
+		if err := w.Add(big); err != nil {
+			t.Fatalf("%s: %v", c, err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("%s: %v", c, err)
+		}
+		if got := packCodecs(t, buf.Bytes()); len(got) != 1 || got[0] != c.Algorithm {
+			t.Fatalf("%s: codecs = %v", c, got)
+		}
+		objs, err := collect(t, NewReader(&buf))
+		if err != nil || len(objs) != 1 || !bytes.Equal(objs[0].Bytes, big.Bytes) {
+			t.Fatalf("%s: read back %d objects, %v", c, len(objs), err)
+		}
+	}
+}
+
+func TestReaderReadsAPackThatMixesCodecs(t *testing.T) {
+	objs := []fstree.Object{
+		mkObj(t, bytes.Repeat([]byte("raw "), 5000)),
+		mkObj(t, bytes.Repeat([]byte("zstd "), 5000)),
+		mkObj(t, bytes.Repeat([]byte("lz4 "), 5000)),
+		mkObj(t, nil),
+	}
+	settings := []Compression{{}, {Zstd, 0}, {LZ4, 0}, {LZ4, 9}}
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	for i, o := range objs {
+		rec, err := EncodeRecordWith(o.Key, o.Bytes, settings[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.AddRecord(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := []Algorithm{None, Zstd, LZ4, None} // the empty object cannot shrink
+	if got := packCodecs(t, buf.Bytes()); !slices.Equal(got, want) {
+		t.Fatalf("codecs = %v, want %v", got, want)
+	}
+	got, err := collect(t, NewReader(&buf))
+	if err != nil || len(got) != len(objs) {
+		t.Fatalf("read %d objects, %v", len(got), err)
+	}
+	for i, o := range objs {
+		if got[i].Key != o.Key || !bytes.Equal(got[i].Bytes, o.Bytes) {
+			t.Errorf("object %d mismatch", i)
+		}
+	}
+}
+
+func TestWriterWithInvalidCompressionFailsAdd(t *testing.T) {
+	w := NewWriter(io.Discard, WithCompression(Compression{Algorithm: Zstd, Level: 99}))
+	for range 2 {
+		if err := w.Add(mkObj(t, []byte("alpha"))); !errors.Is(err, ErrInvalidCompression) {
+			t.Fatalf("Add: err = %v, want ErrInvalidCompression", err)
+		}
 	}
 }
