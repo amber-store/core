@@ -61,6 +61,9 @@ func (g *sealedSegment) verify(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("%s: record at offset %d: %w", g.path, off, err)
 		}
+		if versionFor(rec.Flags) > g.version() {
+			return fmt.Errorf("%w: %s: record at offset %d: codec %d in a version-%d segment", ErrCorrupt, g.path, off, rec.Flags, g.version())
+		}
 		payload, err := amberpack.DecodePayload(rec.Flags, rec.Ulen, g.mm[off+amberpack.RecHeaderSize:off+amberpack.RecHeaderSize+int64(rec.Slen)])
 		if err != nil {
 			return fmt.Errorf("%s: record at offset %d: %w", g.path, off, err)

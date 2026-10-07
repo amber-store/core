@@ -64,11 +64,12 @@ func WithSync(b bool) Option {
 // activeSegment is the append-only segment this store owns and writes to.
 // Other stores on the directory own theirs (active.go).
 type activeSegment struct {
-	id    uint64
-	path  string
-	f     *os.File
-	size  int64 // accessed only under appendMu
-	index map[key.Key]activeLoc
+	id      uint64
+	path    string
+	version byte // the header's format version: which records it may hold
+	f       *os.File
+	size    int64 // accessed only under appendMu
+	index   map[key.Key]activeLoc
 	// sc mirrors index on disk (sidecar.go), so that the next open does not
 	// have to scan the data. Nil when it could not be written. Under appendMu.
 	sc *sidecarWriter
@@ -104,8 +105,13 @@ type Store struct {
 	// nothing skip the next listing (viewIsCurrent). Guarded by mu.
 	dirMtime, listedAt time.Time
 	nextID             uint64 // a floor for new segment ids; under appendMu
-	closed             bool
-	failed             error // sticky write-path failure; written under appendMu+mu, read under either
+	// segVersion is the format version this store creates active segments
+	// at, and the lowest at which it adopts one. It starts from the
+	// compression option and is raised for good by the first record that
+	// needs more. Under appendMu.
+	segVersion byte
+	closed     bool
+	failed     error // sticky write-path failure; written under appendMu+mu, read under either
 
 	// scrubMu/scrubN/scrubC track in-flight lock-free mmap walks (Verify,
 	// ScanIndex, Record): Close/Wipe/Remove wait for scrubN to reach 0 before
@@ -206,6 +212,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("packstore: %s is held by an older release, which needs the store to itself: %w", dir, err)
 	}
 	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1, writes: make(map[*writeToken]time.Time)}
+	s.segVersion = versionFor(byte(cfg.compression.Algorithm))
 	s.scrubC = sync.NewCond(&s.scrubMu)
 	if s.gate, err = openGate(dir, s.refresh); err != nil {
 		dirF.Close()
@@ -261,6 +268,11 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	if s.failed != nil {
 		return s.failed
 	}
+	// A record beyond zstd goes into a segment at versionAnyCodec only, and
+	// a store that has written one stays at that version: it leaves a
+	// segment early once, not once per segment.
+	need := versionFor(rec[33])
+	s.segVersion = max(s.segVersion, need)
 	if err := s.ensureActiveLocked(); err != nil {
 		return err
 	}
@@ -277,6 +289,18 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 			s.deferred.Store(false)
 		}
 		return nil
+	}
+	if a.version < need {
+		// The segment this store holds may not take the record. Its header
+		// is never rewritten: an older release that has read it would go on
+		// to misread what follows.
+		if err := s.leaveActiveLocked(); err != nil {
+			return err
+		}
+		if err := s.ensureActiveLocked(); err != nil {
+			return err
+		}
+		a = s.active
 	}
 	off := a.size
 	if _, err := a.f.WriteAt(rec, off); err != nil {

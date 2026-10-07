@@ -98,7 +98,7 @@ func recoverFrom(data io.ReaderAt, size int64, sidecar []byte) (res recovered, o
 	if err != nil {
 		return recovered{}, false, err
 	}
-	if !bytes.Equal(header, magicHeader) {
+	if !isHeader(header) {
 		return recovered{}, false, nil
 	}
 	if size >= headerLen+trailerSize {
@@ -147,7 +147,7 @@ func (sc *segmentScan) advance(data io.ReaderAt, size int64, tail []byte) (added
 		if err := checkVersion(header); err != nil {
 			return nil, nil, false, err
 		}
-		if !bytes.Equal(header, magicHeader) {
+		if !isHeader(header) {
 			return nil, nil, true, nil
 		}
 		sc.pos = headerLen
