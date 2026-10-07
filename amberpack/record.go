@@ -59,31 +59,34 @@ func init() {
 	}
 }
 
-// zstdEncs holds one encoder per klauspost tier, built on first use: an
-// encoder's tables are sized by its tier, and most processes use one tier.
-// EncodeAll is safe for concurrent use.
-var zstdEncs [zstd.SpeedBestCompression]struct {
-	once sync.Once
-	enc  *zstd.Encoder
-}
+// zstdEncs pools the encoders of each klauspost tier. An encoder keeps one
+// set of tables per unit of its concurrency for as long as it lives, tens of
+// megabytes each at the best tier, so each is built with a concurrency of
+// one and pooled: a process holds as many as it has goroutines encoding at
+// once, and the pool lets go of the idle ones.
+var zstdEncs [zstd.SpeedBestCompression]sync.Pool
 
-// zstdEncoder returns the encoder for a zstd level from 0 to 22. klauspost
-// has four tiers where zstd has 22 levels; EncoderLevelFromZstd picks the
-// nearest (1–2 fastest, 3–5 default, 6–9 better, 10–22 best).
-func zstdEncoder(level int) *zstd.Encoder {
+// zstdEncodeAll appends data, compressed at a zstd level from 0 to 22, to
+// dst. klauspost has four tiers where zstd has 22 levels;
+// EncoderLevelFromZstd picks the nearest (1–2 fastest, 3–5 default, 6–9
+// better, 10–22 best).
+func zstdEncodeAll(level int, data, dst []byte) []byte {
 	if level == 0 {
 		level = 3 // zstd's own default
 	}
 	tier := zstd.EncoderLevelFromZstd(level)
-	e := &zstdEncs[tier-zstd.SpeedFastest]
-	e.once.Do(func() {
-		enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(tier))
+	pool := &zstdEncs[tier-zstd.SpeedFastest]
+	enc, _ := pool.Get().(*zstd.Encoder)
+	if enc == nil {
+		var err error
+		enc, err = zstd.NewWriter(nil, zstd.WithEncoderLevel(tier), zstd.WithEncoderConcurrency(1))
 		if err != nil {
 			panic(err) // the options are fixed and valid
 		}
-		e.enc = enc
-	})
-	return e.enc
+	}
+	out := enc.EncodeAll(data, dst)
+	pool.Put(enc)
+	return out
 }
 
 // The lz4 compressors carry hash tables and are not safe for concurrent use,
@@ -103,7 +106,7 @@ func compress(c Compression, data []byte) []byte {
 	}
 	switch c.Algorithm {
 	case Zstd:
-		if out := zstdEncoder(c.Level).EncodeAll(data, make([]byte, 0, len(data))); len(out) < len(data) {
+		if out := zstdEncodeAll(c.Level, data, make([]byte, 0, len(data))); len(out) < len(data) {
 			return out
 		}
 	case LZ4:

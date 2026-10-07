@@ -235,7 +235,7 @@ func TestDecodePayloadErrors(t *testing.T) {
 		}
 	})
 	t.Run("bomb stops at ulen", func(t *testing.T) {
-		bomb := zstdEncoder(0).EncodeAll(make([]byte, 64<<20), nil)
+		bomb := zstdEncodeAll(0, make([]byte, 64<<20), nil)
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
 		_, err := DecodePayload(byte(Zstd), 1024, bomb)
@@ -248,7 +248,7 @@ func TestDecodePayloadErrors(t *testing.T) {
 		}
 	})
 	t.Run("ulen mismatch", func(t *testing.T) {
-		comp := zstdEncoder(0).EncodeAll([]byte("hello world"), nil)
+		comp := zstdEncodeAll(0, []byte("hello world"), nil)
 		if _, err := DecodePayload(byte(Zstd), 5, comp); !errors.Is(err, ErrCorrupt) {
 			t.Fatalf("want ErrCorrupt, got %v", err)
 		}
@@ -498,5 +498,30 @@ func TestDecodePayloadRejectsUnknownCodec(t *testing.T) {
 		if _, err := DecodePayload(flags, 4, []byte{1, 2, 3, 4}); !errors.Is(err, ErrCorrupt) {
 			t.Errorf("flags %#x: err = %v, want ErrCorrupt", flags, err)
 		}
+	}
+}
+
+// TestZstdEncodersAreNotRetained guards against holding every zstd encoder
+// for the life of the process. An encoder built for EncodeAll keeps one set
+// of tables per unit of its concurrency — tens of megabytes each at the best
+// tier, times GOMAXPROCS by default — so one small object at zstd 19 used to
+// pin hundreds of megabytes on a many-core machine.
+func TestZstdEncodersAreNotRetained(t *testing.T) {
+	o := mkObj(t, compressible(4096))
+	for _, level := range []int{1, 3, 7, 19} {
+		if _, err := EncodeRecordWith(o.Key, o.Bytes, Compression{Algorithm: Zstd, Level: level}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A sync.Pool lets go of its idle entries after two collections.
+	for range 3 {
+		runtime.GC()
+	}
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	const limit = 64 << 20
+	if m.HeapAlloc > limit {
+		t.Fatalf("%d MiB of heap still in use after encoding four small objects (GOMAXPROCS %d); want under %d MiB",
+			m.HeapAlloc>>20, runtime.GOMAXPROCS(0), limit>>20)
 	}
 }

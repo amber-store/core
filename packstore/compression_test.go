@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -433,6 +434,142 @@ func TestRepairReplacementUsesTheHandlesCompression(t *testing.T) {
 		t.Fatalf("replacement stored as %s, want lz4", c)
 	}
 	mustGet(t, s, o)
+	if err := s.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestCompressionForInvalidValueMidRun has the callback reject one object in
+// the middle of a run: what was written before it stays, the rejected object
+// is absent, and the store keeps working.
+func TestCompressionForInvalidValueMidRun(t *testing.T) {
+	const reject = 20
+	var bad atomic.Bool
+	choose := func(_ key.Key, data []byte, def amberpack.Compression) amberpack.Compression {
+		if bad.Load() && data[len(data)-2] == reject { // distinct's low index byte
+			return amberpack.Compression{Algorithm: amberpack.LZ4, Level: 99}
+		}
+		return def
+	}
+	objs := distinct(t, 40)
+
+	t.Run("WriteBatch", func(t *testing.T) {
+		bad.Store(true)
+		s := rawStore(t, WithCompression(zstdDefault), WithCompressionFor(choose))
+		err := s.WriteBatch(objSeq(objs, -1))
+		if !errors.Is(err, amberpack.ErrInvalidCompression) || !strings.Contains(err.Error(), objs[reject].Key.String()) {
+			t.Fatalf("err = %v, want ErrInvalidCompression naming object %d", err, reject)
+		}
+		for i, o := range objs {
+			has, err := s.Has(o.Key)
+			if err != nil || has != (i < reject) {
+				t.Fatalf("object %d: Has = %v, %v; a batch keeps exactly the objects before the rejected one", i, has, err)
+			}
+		}
+		for _, o := range objs[:reject] {
+			mustGet(t, s, o)
+		}
+	})
+
+	t.Run("WriteParallel", func(t *testing.T) {
+		bad.Store(true)
+		s := rawStore(t, WithCompression(zstdDefault), WithCompressionFor(choose))
+		stats, err := s.WriteParallel(objSeq(objs, -1), WriteOpts{Writers: 4})
+		if !errors.Is(err, amberpack.ErrInvalidCompression) {
+			t.Fatalf("err = %v, want ErrInvalidCompression", err)
+		}
+		stored := 0
+		for i, o := range objs {
+			has, err := s.Has(o.Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if i == reject && has {
+				t.Fatal("the rejected object was stored")
+			}
+			if has {
+				stored++
+				mustGet(t, s, o)
+			}
+		}
+		if stored != stats.Stored {
+			t.Fatalf("the stats say %d objects stored, the store holds %d", stats.Stored, stored)
+		}
+		if err := s.Verify(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// The store is not poisoned: the same run goes through once the
+		// callback behaves.
+		bad.Store(false)
+		if _, err := s.WriteParallel(objSeq(objs, -1), WriteOpts{Writers: 4}); err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range objs {
+			mustGet(t, s, o)
+		}
+	})
+}
+
+// listDir returns "name size" for every entry of dir, in name order.
+func listDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, fmt.Sprintf("%s %d", e.Name(), info.Size()))
+	}
+	return out
+}
+
+// TestRejectedRepairLeavesTheStoreUntouched damages a sealed record and asks
+// for a repair whose replacement the callback makes impossible to encode:
+// the call fails before it changes anything on disk, the active segment
+// stays active, and the repair goes through once the callback behaves.
+func TestRejectedRepairLeavesTheStoreUntouched(t *testing.T) {
+	var bad atomic.Bool
+	s := rawStore(t, WithCompression(zstdDefault), WithCompressionFor(
+		func(_ key.Key, _ []byte, def amberpack.Compression) amberpack.Compression {
+			if bad.Load() {
+				return amberpack.Compression{Algorithm: amberpack.Zstd, Level: 99}
+			}
+			return def
+		}))
+	o := blobObj(t, compressible(8192))
+	if err := s.Put(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	off := s.active.index[o.Key].off
+	if err := s.sealActiveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	damageRepairRecord(t, s.sealed[0].path, off+amberpack.RecHeaderSize)
+	later := blobObj(t, []byte("a later object, in a new active segment"))
+	if err := s.Put(later.Key, later.Data); err != nil {
+		t.Fatal(err)
+	}
+
+	before := listDir(t, s.dir)
+	bad.Store(true)
+	if err := s.PutVerified(o.Key, o.Data); !errors.Is(err, amberpack.ErrInvalidCompression) {
+		t.Fatalf("PutVerified: err = %v, want ErrInvalidCompression", err)
+	}
+	if after := listDir(t, s.dir); !slices.Equal(after, before) {
+		t.Fatalf("a rejected repair changed the store directory:\nbefore %v\nafter  %v", before, after)
+	}
+
+	bad.Store(false)
+	if err := s.PutVerified(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	mustGet(t, s, o)
+	mustGet(t, s, later)
 	if err := s.Verify(context.Background()); err != nil {
 		t.Fatal(err)
 	}
