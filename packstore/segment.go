@@ -27,17 +27,21 @@ const (
 	tagDelete byte = 0x02 // reserved for v2 GC; never written in v1
 )
 
-// Segment format versions: the last byte of a segment's header. The two have
-// the same layout; the version says which codecs the segment's records may
-// use. A segment at versionBase holds only raw and zstd records, which is all
-// that releases up to 0.9.0 read. Those releases refuse a segment at any
-// other version, and would misread an lz4 record in one they accept, so an
-// lz4 record is only ever written to a segment at versionLZ4. A later codec
-// takes a later version in the same way: a release must refuse the segments
-// whose records it cannot read (architecture/packstore.md).
+// Segment format versions: the last byte of a segment's header. They have the
+// same layout; the version says which records the segment may hold, each one
+// everything the one before it may. A segment at versionBase holds only raw and
+// zstd records of the store's own types, which is all that releases up to 0.9.0
+// read. Those releases refuse a segment at any other version, and would misread
+// an lz4 record in one they accept, so an lz4 record is never written below
+// versionLZ4. Releases up to 0.10.0 refuse a segment above that, and their scan
+// of an active segment would truncate at a key of a type they do not know, so a
+// git record is never written below versionGit. A later codec or key type takes
+// a later version in the same way: a release must refuse the segments whose
+// records it cannot read (architecture/packstore.md).
 const (
 	versionBase byte = 2
 	versionLZ4  byte = 3
+	versionGit  byte = 4
 )
 
 var (
@@ -64,10 +68,10 @@ func checkVersion(b []byte) error {
 	if len(b) <= n || !bytes.Equal(b[:n], magicHeader[:n]) || readsVersion(b[n]) {
 		return nil
 	}
-	return fmt.Errorf("%w: %d, this release reads %d and %d", ErrUnsupportedVersion, b[n], versionBase, versionLZ4)
+	return fmt.Errorf("%w: %d, this release reads %d to %d", ErrUnsupportedVersion, b[n], versionBase, versionGit)
 }
 
-func readsVersion(v byte) bool { return v == versionBase || v == versionLZ4 }
+func readsVersion(v byte) bool { return v >= versionBase && v <= versionGit }
 
 // isHeader reports whether b is a segment header of a version this release
 // reads.
@@ -84,8 +88,17 @@ func headerAt(version byte) []byte {
 }
 
 // versionFor returns the lowest segment version that may hold a record with
-// the given flags byte.
-func versionFor(flags byte) byte {
+// the given key and flags byte.
+func versionFor(k key.Key, flags byte) byte {
+	if k.Type() == key.GitSHA1 {
+		return versionGit
+	}
+	return versionForCodec(flags)
+}
+
+// versionForCodec returns the lowest segment version that may hold a record
+// with the given flags byte, whatever its key.
+func versionForCodec(flags byte) byte {
 	if amberpack.Algorithm(flags) > amberpack.Zstd {
 		return versionLZ4
 	}

@@ -159,7 +159,7 @@ func TestNewFromHash_LengthSizeBoundaries(t *testing.T) {
 
 func TestNewFromHash_ReservedType(t *testing.T) {
 	var full [32]byte
-	for _, ty := range []Type{6, 15, 16, 255} {
+	for _, ty := range []Type{7, 15, 16, 255} {
 		if _, err := NewFromHash(ty, 1, full); !errors.Is(err, ErrReservedType) {
 			t.Errorf("Type(%d): err = %v, want ErrReservedType", uint8(ty), err)
 		}
@@ -266,7 +266,7 @@ func TestValidate_ReservedBit(t *testing.T) {
 
 func TestValidate_ReservedType(t *testing.T) {
 	var k Key
-	k[31] = 6 << 4 // type 6, lengthSize 1
+	k[31] = 7 << 4 // type 7, lengthSize 1
 	k[30] = 0x01
 	if err := k.Validate(); !errors.Is(err, ErrReservedType) {
 		t.Errorf("err = %v, want ErrReservedType", err)

@@ -10,6 +10,7 @@ import (
 
 	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/fstree"
+	"github.com/amber-store/core/gitobj"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
 	"github.com/zeebo/blake3"
@@ -218,5 +219,68 @@ func TestWithGateBracketsDrain(t *testing.T) {
 	}
 	if !writtenAtRelease {
 		t.Fatal("gate released before the entry's objects were written")
+	}
+}
+
+func gitObject(t *testing.T, kind gitobj.Kind, body string) fstree.Object {
+	t.Helper()
+	data := gitobj.Encode(kind, []byte(body))
+	k, err := gitobj.KeyOf(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fstree.Object{Key: k, Bytes: data}
+}
+
+func stageAndWait(t *testing.T, ib *Inbox, root key.Key, body []byte) []byte {
+	t.Helper()
+	tmp, h, _, err := ib.Stage(Meta{Root: root[:]}, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added, err := ib.Commit(tmp, h, root); err != nil || !added {
+		t.Fatalf("Commit: added=%v err=%v", added, err)
+	}
+	ib.WaitFor(root)
+	return h
+}
+
+func TestGitObjectsArriveInAPack(t *testing.T) {
+	store := newTestStore(t)
+	ib, err := Open(filepath.Join(t.TempDir(), "inbox"), store, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ib.Close() })
+	blob := gitObject(t, gitobj.Blob, "hello\n")
+	sum, _ := blob.Key.GitSHA1Sum()
+	tree := gitObject(t, gitobj.Tree, "100644 f\x00"+string(sum[:]))
+	stageAndWait(t, ib, tree.Key, packBody(t, blob, tree))
+	for _, o := range []fstree.Object{blob, tree} {
+		got, err := store.Get(o.Key)
+		if err != nil || !bytes.Equal(got, o.Bytes) {
+			t.Errorf("object %s: %q, %v", o.Key, got, err)
+		}
+	}
+}
+
+// A pack is trusted for its framing and nothing else: a payload that does not
+// hash to its SHA-1 does not get in, and the entry is quarantined.
+func TestForgedGitObjectIsQuarantined(t *testing.T) {
+	store := newTestStore(t)
+	dir := filepath.Join(t.TempDir(), "inbox")
+	ib, err := Open(dir, store, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ib.Close() })
+	real := gitObject(t, gitobj.Blob, "hello\n")
+	forged := fstree.Object{Key: real.Key, Bytes: gitobj.Encode(gitobj.Blob, []byte("hullo\n"))}
+	h := stageAndWait(t, ib, real.Key, packBody(t, forged))
+	if has, err := store.Has(real.Key); err != nil || has {
+		t.Errorf("Has after the forged pack: %v, %v", has, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "failed", hex.EncodeToString(h)+".pack")); err != nil {
+		t.Errorf("entry should be quarantined: %v", err)
 	}
 }

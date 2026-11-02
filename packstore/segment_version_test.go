@@ -427,7 +427,7 @@ func TestOpenRefusesAVersionBeyondTheOnesItReads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b[7] = 4
+	b[7] = 5
 	if err := os.WriteFile(sealed[0], b, 0o644); err != nil {
 		t.Fatal(err)
 	}

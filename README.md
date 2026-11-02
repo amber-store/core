@@ -49,11 +49,13 @@ store:
 | `DirNode`  | Directory index node (directory tree).                      |
 | `XattrSet` | Spilled extended attributes, when too large to inline.      |
 | `Commit`   | Snapshot record: a tree (or the sides of a conflict), parent commits, author, committer, message, change id. |
+| `GitSHA1`  | A git object as git hashed it, under its SHA-1, so that a repository keeps its ids ([architecture/git-objects.md](architecture/git-objects.md)). |
 
 ## Encoding
 
 - **Keys** are 32 bytes: a type/length header plus a truncated
-  [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash of the content.
+  [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash of the content, or for a
+  git object its SHA-1.
 - **Structured objects** use **deterministic CBOR**
   ([RFC 8949 §4.2](https://www.rfc-editor.org/rfc/rfc8949#name-deterministically-encoded-c));
   `Blob`s are raw bytes. Deterministic encoding is required because the key's hash
@@ -72,9 +74,10 @@ one host, on a local filesystem.
 
 | Package | Role |
 |---------|------|
-| `key` | The 32-byte content key: type, length, truncated BLAKE3 hash. |
+| `key` | The 32-byte content key: type, length, truncated BLAKE3 hash (for a git object, its SHA-1). |
 | `fstree` | Tree objects (encode/decode), bottom-up builders, and the read paths: entry lookup, ordered listing, content streaming, reachable-set walks, completeness checks. A commit key reads as its tree, as a root and as the content key of a directory entry. |
 | `commit` | The commit record: canonical CBOR encoding and validation; a change id and conflicted trees for jj; signature fields carried opaquely. |
+| `gitobj` | Git objects as the store holds them: the frame, the collision-detecting SHA-1 and the links a walk follows. |
 | `chunkers` | Content-defined byte chunking (ultracdc) and item chunking for tree nodes. |
 | `ingest` | Build a tree from a local directory (or single file): `Objects` streams every built object plus the resolved root; `Dir` writes straight into a packstore; `Scan` sizes progress displays. Honors `.amberignore`; `Opts.Exclude` skips names at the root (a working copy's metadata directory). |
 | `amberignore` | `.gitignore`-semantics exclusion for ingestion. |

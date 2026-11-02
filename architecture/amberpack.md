@@ -85,7 +85,8 @@ questions:
 1. **CRC-32C** — "did these bytes survive storage/transit intact?" Checked
    whenever a record is parsed.
 2. **Payload hash** — "is this really the object its key claims?" The key embeds
-   a BLAKE3 digest of the object's serialized bytes ([keys.md](keys.md)). The
+   a BLAKE3 digest of the object's serialized bytes ([keys.md](keys.md)), or for a
+   [git object](git-objects.md) its SHA-1. The
    record codec does **not** verify this; it is re-checked in the storage path
    (packstore's parallel write with verification) before anything is committed.
 

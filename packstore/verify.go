@@ -8,6 +8,7 @@ import (
 
 	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/commit"
+	"github.com/amber-store/core/gitobj"
 	"github.com/amber-store/core/key"
 	"github.com/zeebo/blake3"
 )
@@ -61,8 +62,8 @@ func (g *sealedSegment) verify(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("%s: record at offset %d: %w", g.path, off, err)
 		}
-		if versionFor(rec.Flags) > g.version() {
-			return fmt.Errorf("%w: %s: record at offset %d: codec %d in a version-%d segment", ErrCorrupt, g.path, off, rec.Flags, g.version())
+		if versionFor(rec.Key, rec.Flags) > g.version() {
+			return fmt.Errorf("%w: %s: record at offset %d: %v key, codec %d in a version-%d segment", ErrCorrupt, g.path, off, rec.Key.Type(), rec.Flags, g.version())
 		}
 		payload, err := amberpack.DecodePayload(rec.Flags, rec.Ulen, g.mm[off+amberpack.RecHeaderSize:off+amberpack.RecHeaderSize+int64(rec.Slen)])
 		if err != nil {
@@ -100,8 +101,15 @@ func (g *sealedSegment) verify(ctx context.Context) error {
 // own bytes plus the trees it records — which the commit's own bytes suffice
 // to recompute. A commit that does not decode fails verification. The other
 // aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the store
-// does not recompute, so only their hash is checked.
+// does not recompute, so only their hash is checked. A git object is held to
+// its SHA-1 instead, and has to be one the store can walk (gitobj.Verify).
 func verifyObject(o Object) error {
+	if o.Key.Type() == key.GitSHA1 {
+		if err := gitobj.Verify(o.Key, o.Data); err != nil {
+			return fmt.Errorf("%w: %s: %w", ErrVerify, o.Key, err)
+		}
+		return nil
+	}
 	sum := blake3.Sum256(o.Data)
 	want, err := key.NewFromHash(o.Key.Type(), o.Key.Length(), sum)
 	if err != nil {
