@@ -102,7 +102,7 @@ func (g *sealedSegment) verify(ctx context.Context) error {
 // to recompute. A commit that does not decode fails verification. The other
 // aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the store
 // does not recompute, so only their hash is checked. A git object is held to
-// its SHA-1 instead, and has to be one the store can walk (gitobj.Verify).
+// its SHA-1 instead, and to its frame (gitobj.Verify).
 func verifyObject(o Object) error {
 	if o.Key.Type() == key.GitSHA1 {
 		if err := gitobj.Verify(o.Key, o.Data); err != nil {

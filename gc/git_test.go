@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -351,6 +352,84 @@ func oidOf(t *testing.T, k key.Key) string {
 		t.Fatalf("%s is not a git key", k)
 	}
 	return fmt.Sprintf("%x", sum)
+}
+
+// An object only ever named as a file is never parsed, by git or by the store, and
+// a repository may hold one that would not parse. It gets in through a verifying
+// write and keeps a reference, and it must not stop the sweeps that copy it: a
+// collection refused for the whole store, over bytes nothing has any need to read.
+func TestAnObjectNamedOnlyAsAFileDoesNotStopCollection(t *testing.T) {
+	ts := newTestStore(t, 2<<10)
+	c := ts.openCollector(t, Options{Grace: time.Hour})
+	put := func(kind gitobj.Kind, body string) key.Key {
+		t.Helper()
+		data := gitobj.Encode(kind, []byte(body))
+		k, err := gitobj.KeyOf(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ts.objects.PutVerified(k, data); err != nil {
+			t.Fatalf("PutVerified of a framed object: %v", err)
+		}
+		return k
+	}
+	// git reads a commit like this as a file, and would not as a commit.
+	unparsable := put(gitobj.Commit, "this is no commit")
+	top := put(gitobj.Tree, gitEntry(t, "100644", "f", unparsable))
+	tip := put(gitobj.Commit, "tree "+oidOf(t, top)+"\n")
+	var dead []key.Key
+	for i := range 20 {
+		dead = append(dead, put(gitobj.Blob, fmt.Sprintf("%0400d", i)))
+	}
+	putTestRef(t, c, ts.refs, "main", tip)
+	for i := range 2 {
+		backdatePacks(t, ts)
+		if _, err := c.Run(context.Background(), 0); err != nil {
+			t.Fatalf("cycle %d: %v", i, err)
+		}
+	}
+	if _, err := ts.objects.Get(unparsable); err != nil {
+		t.Errorf("the object a reference keeps: %v", err)
+	}
+	if countGone(t, ts.objects, dead) == 0 {
+		t.Error("no garbage was collected")
+	}
+}
+
+// What a walk has to read, it has to be able to read. That is checked before a
+// reference is accepted, so no accepted reference can stop a mark.
+func TestPrepareRefRefusesWhatCannotBeWalked(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		link func(t *testing.T, st *packstore.Store, bad key.Key) key.Key
+	}{
+		{"the root", func(t *testing.T, st *packstore.Store, bad key.Key) key.Key { return bad }},
+		{"a commit's tree", func(t *testing.T, st *packstore.Store, bad key.Key) key.Key {
+			return storeGit(t, st, gitobj.Commit, "tree "+oidOf(t, bad)+"\n")
+		}},
+		{"a directory entry", func(t *testing.T, st *packstore.Store, bad key.Key) key.Key {
+			return storeGit(t, st, gitobj.Tree, gitEntry(t, "40000", "d", bad))
+		}},
+		{"named as a file and as a directory", func(t *testing.T, st *packstore.Store, bad key.Key) key.Key {
+			return storeGit(t, st, gitobj.Tree, gitEntry(t, "100644", "a", bad)+gitEntry(t, "40000", "b", bad))
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ts := newTestStore(t, 1<<20)
+			coll := ts.openCollector(t, Options{})
+			data := gitobj.Encode(gitobj.Commit, []byte("this is no commit"))
+			bad, err := gitobj.KeyOf(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := ts.objects.PutVerified(bad, data); err != nil {
+				t.Fatalf("PutVerified of a framed object: %v", err)
+			}
+			if _, _, err := coll.PrepareRef(c.link(t, ts.objects, bad)); !errors.Is(err, gitobj.ErrMalformed) {
+				t.Errorf("PrepareRef = %v, want ErrMalformed", err)
+			}
+		})
+	}
 }
 
 // A blob's tree entry says what it is, so the mark does not read it: a cycle

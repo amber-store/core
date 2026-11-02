@@ -170,11 +170,38 @@ func TestLinks_CommitOnlyLeadingHeadersAreLinks(t *testing.T) {
 	wantLinks(t, links(t, Commit, body), Link{Key: gitKey(t, oidTree)})
 }
 
-func TestLinks_CommitAcceptsWhatGitAccepts(t *testing.T) {
-	// A commit need not have an author to be walked, nor lowercase hex: git
-	// reads both.
+func TestLinks_CommitNeedsNoAuthorAndNoLowercase(t *testing.T) {
+	// git reads uppercase hex. A commit without an author it calls bogus, and the
+	// walk has no reason to: all it wants is the tree.
 	wantLinks(t, links(t, Commit, "tree "+oidTree+"\n"), Link{Key: gitKey(t, oidTree)})
 	wantLinks(t, links(t, Commit, "tree "+strings.ToUpper(oidTree)+"\n"), Link{Key: gitKey(t, oidTree)})
+}
+
+// git takes a "parent " line for one only if it can hold an id: what is too short
+// to is not a parent and not an error, and git reads the commit (git 2.50,
+// parse_commit_buffer). What is long enough has to be a parent.
+func TestLinks_CommitShortFinalParentLineIsNoParent(t *testing.T) {
+	tree := Link{Key: gitKey(t, oidTree)}
+	for name, tail := range map[string]string{
+		"a few digits":     "parent abc\n",
+		"no id":            "parent \n",
+		"no newline":       "parent " + oidCommit,
+		"no newline, cut":  "parent " + oidCommit[:20],
+		"the word, no end": "parent ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			wantLinks(t, links(t, Commit, "tree "+oidTree+"\n"+tail), tree)
+		})
+	}
+	// After a real parent as well.
+	parent := Link{Key: gitKey(t, oidCommit)}
+	wantLinks(t, links(t, Commit, "tree "+oidTree+"\nparent "+oidCommit+"\nparent abc\n"), tree, parent)
+}
+
+// git copies a tag's type line and compares it as a C string (parse_tag_buffer).
+func TestLinks_TagTypeEndsAtANUL(t *testing.T) {
+	wantLinks(t, links(t, Tag, "object "+oidCommit+"\ntype commit\x00junk\ntag v\n\nm\n"), Link{Key: gitKey(t, oidCommit)})
+	wantLinks(t, links(t, Tag, "object "+oidHello+"\ntype blob\x00junk\ntag v\n\nm\n"), Link{Key: gitKey(t, oidHello), Leaf: true})
 }
 
 func TestLinks_Tree(t *testing.T) {
@@ -245,9 +272,9 @@ func TestLinks_Malformed(t *testing.T) {
 		{"commit tree not hex", Commit, "tree " + strings.Repeat("z", 40) + "\n"},
 		{"commit tree no newline", Commit, "tree " + oidTree},
 		{"commit tree line long", Commit, "tree " + oidTree + "0\n"},
-		{"commit parent short", Commit, "tree " + oidTree + "\nparent abc\n"},
 		{"commit parent not hex", Commit, "tree " + oidTree + "\nparent " + strings.Repeat("z", 40) + "\n"},
-		{"commit parent no newline", Commit, "tree " + oidTree + "\nparent " + oidCommit},
+		{"commit parent long enough, not one", Commit, "tree " + oidTree + "\nparent abc\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\nm\n"},
+		{"commit parent line long", Commit, "tree " + oidTree + "\nparent " + oidCommit + "0\n"},
 		{"tree no space", Tree, "100644"},
 		{"tree empty mode", Tree, " x\x00" + h},
 		{"tree mode not octal", Tree, "100648 x\x00" + h},
@@ -264,6 +291,7 @@ func TestLinks_Malformed(t *testing.T) {
 		{"tag without type", Tag, "object " + oidCommit + "\ntag v\n"},
 		{"tag type unknown", Tag, "object " + oidCommit + "\ntype file\n"},
 		{"tag type no newline", Tag, "object " + oidCommit + "\ntype commit"},
+		{"tag type empty before the NUL", Tag, "object " + oidCommit + "\ntype \x00commit\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if _, err := Links(Encode(c.kind, []byte(c.body))); !errors.Is(err, ErrMalformed) {
@@ -301,12 +329,30 @@ func TestVerify_NotAGitKey(t *testing.T) {
 	}
 }
 
-// The hash is right, and the payload is not a git object: it would have no
-// git id and could never be pushed, read or walked.
-func TestVerify_RefusesWhatDoesNotParse(t *testing.T) {
+// The hash is right, and the payload is not a git object at all: it has no frame.
+func TestVerify_RefusesWhatHasNoFrame(t *testing.T) {
 	for name, data := range map[string][]byte{
-		"not framed":      []byte("hello"),
-		"size wrong":      []byte("blob 9\x00x"),
+		"not framed":   []byte("hello"),
+		"size wrong":   []byte("blob 9\x00x"),
+		"unknown kind": []byte("file 1\x00x"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			k, err := KeyOf(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := Verify(k, data); !errors.Is(err, ErrMalformed) {
+				t.Errorf("Verify = %v, want ErrMalformed", err)
+			}
+		})
+	}
+}
+
+// What an object holds is for whoever reads it. git never parses an object it
+// only reaches as a file, and a repository may well hold one that would not parse:
+// the walk that does read it refuses it then, and nothing short of that may.
+func TestVerify_LeavesTheContentToTheWalks(t *testing.T) {
+	for name, data := range map[string][]byte{
 		"commit is junk":  Encode(Commit, []byte("junk")),
 		"tree is junk":    Encode(Tree, []byte("junk")),
 		"tag is junk":     Encode(Tag, []byte("junk")),
@@ -317,8 +363,11 @@ func TestVerify_RefusesWhatDoesNotParse(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := Verify(k, data); !errors.Is(err, ErrMalformed) {
-				t.Errorf("Verify = %v, want ErrMalformed", err)
+			if err := Verify(k, data); err != nil {
+				t.Errorf("Verify = %v", err)
+			}
+			if _, err := Links(data); !errors.Is(err, ErrMalformed) {
+				t.Errorf("Links = %v, want ErrMalformed", err)
 			}
 		})
 	}

@@ -42,8 +42,8 @@ raw and zstd records; a version-3 segment may hold lz4 records as well
 misread an lz4 record in a segment they accept: their read path returns the
 lz4 block as the object's bytes, and their scan of an active segment
 truncates at the first one. A segment they refuse they leave alone. So an
-lz4 record is only ever written to a version-3 segment, and a store that
-holds such a segment is refused by those releases as a whole, at open. A
+lz4 record is only ever written to a segment at version 3 or above, and a store
+that holds such a segment is refused by those releases as a whole, at open. A
 later codec takes a later version in the same way: a release has to refuse
 the segments whose records it cannot read, and this one too would take a
 record of a codec it does not know for a torn tail.
@@ -64,8 +64,8 @@ on it creates segments at that version, so it pays for one early seal and not
 for one per segment. A header is never rewritten: a running older release may
 already have read it. The segment the writer continues in is checked for the
 record like any other: it may be one somebody left behind. An empty segment
-that was let go stays where it is until a writer at its version takes it. A
-segment whose header never arrived, which its next writer starts over, gets
+that was let go stays where it is until a writer at or below its version takes
+it. A segment whose header never arrived, which its next writer starts over, gets
 that writer's version. A store whose writers are never set to lz4 and never
 take an lz4 or git record stays at version 2.
 
@@ -161,8 +161,8 @@ appends to it. Only when every active segment is held by a live writer does it
 create one. Serial writers therefore keep filling one segment to the segment
 size; the number of active segments is bounded by the peak number of
 simultaneous writers and drifts back to one as they fill. A writer that has
-moved to version-3 segments passes over a version-2 one, leaving it for a
-writer that can use it; a writer at version 2 adopts either.
+moved to a higher version passes over a segment below it, leaving it for a
+writer that can use it; a writer at version 2 adopts any.
 
 **Creating** a segment with an id above every id in the directory:
 
@@ -332,9 +332,9 @@ above:
 - **Refuse a segment of a format version other than 2, 3 and 4** and leave it as
   it is; only a header that is missing or not this format's magic at all may
   be reset.
-- **An lz4 record only in a version-3 segment.** Never append one to a
-  version-2 segment, and never rewrite a header: leave the segment and
-  continue in a version-3 one, checking it for the record first. A repair
+- **An lz4 record only in a segment at version 3 or above.** Never append one to
+  a version-2 segment, and never rewrite a header: leave the segment and
+  continue in one at version 3 or above, checking it for the record first. A repair
   that rewrites a sealed segment keeps its version, raised to 3 when the
   replacement record needs it. A scrub, which covers sealed segments, reports
   an lz4 record in a version-2 one as corruption. Sealing idle segments for a

@@ -28,8 +28,10 @@ object type that holds a git object under the id git gives it.
 - **Payload:** the exact bytes git hashes, `<kind> <size>\0<content>`.
 - **Collision-detecting SHA-1** (`pjbgf/sha1cd`, `sha1-checked` in Rust), a new
   dependency on each side.
-- **Verification** checks the hash, the frame and that the links can be read, and
-  stays well short of `git fsck`, so that old repositories get in.
+- **Verification** checks the hash and the frame and leaves the content to the
+  walks, which refuse what they cannot read before a reference is accepted. The
+  first version also parsed the links; the review showed that an object only named
+  as a file, which git never parses, could then not be pushed or could stop sweeps.
 - **Submodule commits are not followed**, and a mode goes by git's `canon_mode`.
 - **Blobs are marked without being read**, going by the referring tree entry or
   tag, with a second bit so that a link that calls the same object a directory

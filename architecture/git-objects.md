@@ -48,8 +48,8 @@ repository holds once inflated. The record's own codec compresses it like any
 other payload.
 
 A git object is never chunked: its SHA-1 covers it whole, so it is one record, and
-[`amberpack.MaxPayload`](amberpack.md) (256 MiB) is the largest git object a store
-can hold. Nor are there deltas: each version of a file is stored in full, and a
+[`amberpack.MaxPayload`](amberpack.md) (256 MiB, the frame included) is the largest
+git object a store can hold. Nor are there deltas: each version of a file is stored in full, and a
 repository takes about what its loose objects would, more than a git packfile.
 
 ## Verification
@@ -63,11 +63,20 @@ copies of a compaction, a scrub), a git object is held to more than a hash:
    dedups by key would keep whichever of two colliding objects came first, for
    everybody.
 2. **The right SHA-1.** The payload hashes to the key.
-3. **A git object that can be walked.** The frame is correct and the links below
-   can be read. This is deliberately far short of `git fsck`: an old repository's
-   oddly sorted trees, zero-padded modes and commits missing an author must get in,
-   since git reads them. What must not get in is what a walk cannot read, which
-   would stop every later collection while a reference reaches it.
+3. **A frame.** The payload is framed as above: it is a git object at all.
+
+The content is left alone. Reading it is the business of whoever has to, and that
+comes down to the [walks](#links): an interior object that cannot be read is
+refused by `CheckComplete` before a reference to it is accepted, so no accepted
+reference can stop a mark. An object only ever named as a file is never parsed,
+by git or by the store, and a repository may hold one that would not parse. If
+verification parsed it, it could not be pushed, and written any other way, every
+sweep that had to copy it would be refused, for the whole store.
+
+`packstore.Put` verifies nothing, for this type as for any other. An unframed
+payload written that way, under its SHA-1 and named as a file, passes
+`CheckComplete`, and then fails the sweeps, as a wrong payload under a `Blob` key
+does. Whoever takes objects from others uses a verifying write.
 
 ## Links
 
@@ -84,7 +93,11 @@ history alive, as for the store's own commits.
 | `tag`    | the `object` line |
 
 - **A commit's links are its leading lines,** as git reads them. A later header
-  or a message may say `parent`; a merge tag embeds `object` and `type` lines.
+  or a message may say `parent`; a merge tag embeds `object` and `type` lines. A
+  `parent ` too short to hold an id is not a parent line, and not an error. In the
+  safe direction the walk asks less than git: it does not need an author.
+- **A tag's type is a C string,** as git compares it: `type commit\0junk` says
+  `commit`.
 - **A mode decides what a tree entry is,** by its file-type bits, as git's
   `canon_mode` does: `040000` is a directory, `100000` and `120000` are blobs, and
   anything else is a gitlink.
@@ -94,6 +107,11 @@ history alive, as for the store's own commits.
 
 Everything a walk reaches must be there: `CheckComplete` fails on a missing
 object, so a reference to a head from a shallow or partial clone is refused.
+
+So a push has to send what git reaches from the head, as `git rev-list --objects`
+lists it and `git cat-file --batch` serves it. Enumerating what a repository stores
+is not the same thing: git supplies the empty tree `4b825dc…` without storing it, so
+`--batch-all-objects` can omit an object a commit names.
 
 ### Walking without reading blobs
 
@@ -120,8 +138,11 @@ truncated the segment at the git record and lost a plain blob written after it.
 
 So a git record is only ever written to a segment at format version 4, which those
 releases refuse, the whole store, at open and without touching it
-([packstore.md](packstore.md)). A wire pack needs no such gate: their pack reader
-refuses a record with such a key as corrupt.
+([packstore.md](packstore.md)). An older process that was already running when
+the first such segment appeared has opened the store and is not refused then. It
+goes on writing to its own segment; a lookup that misses or a sweep fails with the
+unsupported-version error, and the version-4 files stay as they are. A wire pack
+needs no such gate: their pack reader refuses a record with such a key as corrupt.
 
 ## What a git key is not
 

@@ -142,8 +142,10 @@ func KeyOf(data []byte) (key.Key, error) {
 }
 
 // Verify reports whether data is the object k names: not a collision, hashing
-// to k, framed correctly, and with links that can be read. An object that
-// passes can always be walked.
+// to k, and framed as a git object. It leaves the content alone. git does not parse
+// an object it only reaches as a file, and neither does the store: an object that
+// will not parse is refused by the walk that has to read it (Links), which comes
+// before a reference to it is accepted, and by nothing short of that.
 func Verify(k key.Key, data []byte) error {
 	want, err := KeyOf(data)
 	if err != nil {
@@ -152,7 +154,7 @@ func Verify(k key.Key, data []byte) error {
 	if want != k {
 		return fmt.Errorf("%w: payload hashes to %s, not %s", ErrMismatch, want, k)
 	}
-	_, err = Links(data)
+	_, _, err = Parse(data)
 	return err
 }
 
@@ -206,14 +208,15 @@ func idLine(b []byte, prefix string) (key.Key, []byte, error) {
 
 // commitLinks reads the lines git reads a commit's links from: a tree line
 // first, the parent lines right after it. What comes later is not looked at: a
-// merge tag or a message may well say "parent".
+// merge tag or a message may well say "parent". Neither is a "parent " too short
+// to hold an id, which git does not take for a parent line.
 func commitLinks(b []byte) ([]Link, error) {
 	tree, rest, err := idLine(b, "tree ")
 	if err != nil {
 		return nil, err
 	}
 	out := []Link{{Key: tree}}
-	for bytes.HasPrefix(rest, []byte("parent ")) {
+	for len(rest) > len("parent ")+2*key.GitSHA1Size && bytes.HasPrefix(rest, []byte("parent ")) {
 		var parent key.Key
 		if parent, rest, err = idLine(rest, "parent "); err != nil {
 			return nil, err
@@ -223,7 +226,8 @@ func commitLinks(b []byte) ([]Link, error) {
 	return out, nil
 }
 
-// tagLinks reads a tag's target from its first two lines.
+// tagLinks reads a tag's target from its first two lines. git compares the type
+// as a C string, so it ends at a NUL if there is one.
 func tagLinks(b []byte) ([]Link, error) {
 	target, rest, err := idLine(b, "object ")
 	if err != nil {
@@ -237,7 +241,11 @@ func tagLinks(b []byte) ([]Link, error) {
 	if nl < 0 {
 		return nil, malformed(`bad "type" line`)
 	}
-	kind, ok := kindOf(rest[:nl])
+	name := rest[:nl]
+	if nul := bytes.IndexByte(name, 0); nul >= 0 {
+		name = name[:nul]
+	}
+	kind, ok := kindOf(name)
 	if !ok {
 		return nil, malformed(`bad "type" line`)
 	}

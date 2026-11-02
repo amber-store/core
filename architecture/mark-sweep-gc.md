@@ -39,7 +39,7 @@ refLock.Lock    barrier on; snapshot the reference roots   (writers stall: µs)
 refLock.Lock    sweep: packstore.Compact                   (writers stall)
 ```
 
-- **Mark.** For each root in the snapshot, a DFS over `fstree.ChildKeys`.
+- **Mark.** For each root in the snapshot, a DFS over `fstree.Links`.
   Already-marked keys prune the walk, so shared subtrees cost once. A
   missing object aborts the cycle loudly. A [git object](git-objects.md) has
   links too, and a blob among them is marked unread as well, on the word of the

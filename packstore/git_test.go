@@ -425,12 +425,13 @@ func TestVerifyObject_Git(t *testing.T) {
 	if err := verifyObject(Object{Key: k, Data: unframed}); !errors.Is(err, ErrVerify) || !errors.Is(err, gitobj.ErrMalformed) {
 		t.Errorf("no frame: %v, want ErrVerify and ErrMalformed", err)
 	}
+	// A commit that does not parse is the walks' to refuse, if they ever read it.
 	junkCommit := gitobj.Encode(gitobj.Commit, []byte("junk"))
 	if k, err = gitobj.KeyOf(junkCommit); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyObject(Object{Key: k, Data: junkCommit}); !errors.Is(err, ErrVerify) || !errors.Is(err, gitobj.ErrMalformed) {
-		t.Errorf("a commit that does not parse: %v, want ErrVerify and ErrMalformed", err)
+	if err := verifyObject(Object{Key: k, Data: junkCommit}); err != nil {
+		t.Errorf("a framed object: %v", err)
 	}
 }
 
