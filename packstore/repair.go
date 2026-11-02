@@ -25,6 +25,25 @@ func (s *Store) PutVerifiedDeferred(k key.Key, data []byte) error {
 	return s.putVerified(k, data, false)
 }
 
+// finishCrashedSeals finishes every crashed seal in the view that holds k. Called
+// under appendMu.
+func (s *Store) finishCrashedSeals(k key.Key) error {
+	s.mu.RLock()
+	var crashed []*sealedSegment
+	for _, g := range s.sealed {
+		if g.crashedSeal() && g.has(k) {
+			crashed = append(crashed, g)
+		}
+	}
+	s.mu.RUnlock()
+	for _, g := range crashed {
+		if err := s.finishCrashedSeal(g); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	if err := verifyObject(Object{Key: k, Data: data}); err != nil {
 		return err
@@ -58,6 +77,13 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 			damaged = !validRepairRecord(k, raw)
 		}
 	}
+	// A seal whose writer crashed may never have been fsynced: finish it, so that
+	// what it holds can be relied on, or repaired, like any other segment's.
+	if s.cfg.sync {
+		if err := s.finishCrashedSeals(k); err != nil {
+			return err
+		}
+	}
 	// The view can change under a refresh, which takes no appendMu: walk a
 	// snapshot, registered as a scrub so that nothing in it is unmapped.
 	s.mu.RLock()
@@ -66,6 +92,9 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	s.mu.RUnlock()
 	defer s.endScrub()
 	for _, seg := range sealed {
+		if s.cfg.sync && seg.crashedSeal() {
+			continue // somebody else holds it, and is finishing it: not a copy to rely on yet
+		}
 		if off, slen, ok := seg.fv.lookup(k); ok {
 			found = true
 			raw, err := repairRecord(seg, indexEntry{k: k, off: off, slen: slen})
@@ -107,6 +136,9 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	sealed = slices.Clone(s.sealed) // again: it now holds what was the active segment
 	s.mu.RUnlock()
 	for _, seg := range sealed {
+		if s.cfg.sync && seg.crashedSeal() {
+			continue // somebody else's to finish, and not this store's to rewrite
+		}
 		damaged := false
 		if off, slen, ok := seg.fv.lookup(k); ok {
 			raw, err := repairRecord(seg, indexEntry{k: k, off: off, slen: slen})

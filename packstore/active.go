@@ -123,31 +123,7 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 		return false, err
 	}
 	if res.sealed {
-		// A crash between the footer's write and the rename: finish it. The
-		// crash may also have come before the seal's fsync, and a sealed
-		// segment is trusted as durable from here on.
-		sealedPath := strings.TrimSuffix(path, ".active")
-		err := f.Sync()
-		if err == nil {
-			err = os.Rename(path, sealedPath)
-		}
-		if err == nil {
-			err = s.dirF.Sync()
-		}
-		if err != nil {
-			f.Close()
-			return false, err
-		}
-		os.Remove(path + sidecarSuffix) // a sealed segment indexes itself
-		seg, err := openSealed(sealedPath, id)
-		f.Close()
-		if err != nil {
-			return false, err
-		}
-		s.mu.Lock()
-		s.publishSealedLocked(seg)
-		s.mu.Unlock()
-		return false, nil
+		return false, s.finishSeal(id, path, f)
 	}
 	size := res.dataEnd
 	version := header[len(header)-1]
@@ -182,7 +158,11 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 	tail := s.cfg.sync && size > max(res.durable, int64(len(magicHeader)))
 	if tail {
 		s.fsyncs.Add(1)
-		if err := f.Sync(); err != nil {
+		err := f.Sync()
+		if s.beforeAdoptSync != nil {
+			err = s.beforeAdoptSync()
+		}
+		if err != nil {
 			s.setFailed(err)
 			f.Close()
 			return false, err
@@ -198,6 +178,56 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 	s.active = a
 	s.mu.Unlock()
 	return true, nil
+}
+
+// finishSeal finishes a seal whose writer crashed between the footer's write and
+// the rename. The crash may also have come before the seal's fsync, and a sealed
+// segment is trusted as durable from here on. The caller holds f's lock, and this
+// lets go of it.
+func (s *Store) finishSeal(id uint64, path string, f *os.File) error {
+	defer f.Close()
+	sealedPath := strings.TrimSuffix(path, ".active")
+	err := f.Sync()
+	if err == nil {
+		err = os.Rename(path, sealedPath)
+	}
+	if err == nil {
+		err = s.dirF.Sync()
+	}
+	if err != nil {
+		return err
+	}
+	os.Remove(path + sidecarSuffix) // a sealed segment indexes itself
+	seg, err := openSealed(sealedPath, id)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.publishSealedLocked(seg)
+	s.mu.Unlock()
+	return nil
+}
+
+// finishCrashedSeal finishes the seal a view holds under its active name, unless
+// somebody else holds it. Called under appendMu.
+func (s *Store) finishCrashedSeal(g *sealedSegment) error {
+	f, err := os.OpenFile(g.path, os.O_RDWR, 0)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if ok, err := tryLock(f); err != nil || !ok || !isFileAt(f, g.path) {
+		f.Close()
+		return err
+	}
+	res, err := recoverSegment(g.path)
+	if err != nil || !res.sealed {
+		f.Close()
+		return err
+	}
+	return s.finishSeal(g.id, g.path, f)
 }
 
 // createActive makes a new active segment with an id above every one in the

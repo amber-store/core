@@ -138,12 +138,13 @@ type Store struct {
 
 	// refreshSeq counts refreshes of the view, so that a lookup that waited
 	// for one does not repeat it; refreshes counts them for tests.
-	refreshMu   sync.Mutex
-	refreshSeq  atomic.Uint64
-	refreshes   atomic.Int64
-	afterList   func()       // test hook: runs when a refresh has listed the directory, before it opens anything
-	afterDetach func()       // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
-	afterFooter func() error // test hook: runs when a seal wrote the footer, before it syncs; an error it returns stands in for the write's
+	refreshMu       sync.Mutex
+	refreshSeq      atomic.Uint64
+	refreshes       atomic.Int64
+	afterList       func()       // test hook: runs when a refresh has listed the directory, before it opens anything
+	afterDetach     func()       // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
+	afterFooter     func() error // test hook: runs when a seal wrote the footer, before it syncs; an error it returns stands in for the write's
+	beforeAdoptSync func() error // test hook: runs before adoption fsyncs a tail; an error it returns stands in for the fsync's
 
 	gate *gate // gc.lock: writers against a sweep, across processes (gate.go)
 }
@@ -783,7 +784,8 @@ func (s *Store) hasDurably(k key.Key) (bool, error) {
 		return true, nil
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
-		if s.sealed[i].has(k) {
+		g := s.sealed[i]
+		if g.has(k) && (!s.cfg.sync || !g.crashedSeal()) {
 			return true, nil
 		}
 	}

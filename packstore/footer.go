@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/FastFilter/xorfilter"
 	"github.com/amber-store/core/amberpack"
@@ -329,6 +330,14 @@ type sealedSegment struct {
 	fi   os.FileInfo // which file this is: a repair replaces a segment under its name, and an id can come back
 	mm   []byte
 	fv   *footerView
+}
+
+// crashedSeal reports whether this is a seal whose writer died before the rename,
+// mapped as the sealed segment it is about to be. Its body may never have been
+// fsynced: only the fsync that comes with finishing the seal (adopt) says it has, so
+// a store that syncs must not acknowledge a write against it.
+func (g *sealedSegment) crashedSeal() bool {
+	return strings.HasSuffix(g.path, activeSuffix)
 }
 
 // openSealed maps a sealed segment and validates its footer. The fd is closed

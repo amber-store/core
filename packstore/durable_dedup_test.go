@@ -1,6 +1,8 @@
 package packstore
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -247,4 +249,218 @@ func TestAdoptionSyncsOnlyWhatIsUnsynced(t *testing.T) {
 			t.Errorf("the sidecar claims %d durable, and nothing synced it", got)
 		}
 	})
+}
+
+// #27's other door. A writer killed during a seal leaves a whole footer over a body
+// nobody has fsynced, still under its active name. A view maps such a file as the
+// sealed segment it is about to be, and a sealed segment counted as durable.
+func TestACrashedSealIsNotAcknowledgedUnsynced(t *testing.T) {
+	objs := testObjects(t, 3)
+	src := t.TempDir()
+	w, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for _, o := range objs {
+		if err := w.PutVerifiedDeferred(o.Key, o.Data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.afterFooter = func() error { return errors.New("killed") }
+	w.appendMu.Lock()
+	err = w.sealActiveLocked()
+	w.appendMu.Unlock()
+	if err == nil {
+		t.Fatal("the seal went through")
+	}
+	copyDir := func() string {
+		t.Helper()
+		dst := t.TempDir()
+		ents, err := os.ReadDir(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range ents {
+			b, err := os.ReadFile(filepath.Join(src, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dst, e.Name()), b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dst
+	}
+	o := objs[0]
+	for name, write := range map[string]func(s *Store) error{
+		"Put":         func(s *Store) error { return s.Put(o.Key, o.Data) },
+		"PutVerified": func(s *Store) error { return s.PutVerified(o.Key, o.Data) },
+		"WriteBatch": func(s *Store) error {
+			return s.WriteBatch(func(y func(Object, error) bool) { y(o, nil) })
+		},
+		"WriteParallel": func(s *Store) error {
+			_, err := s.WriteParallel(func(y func(Object, error) bool) { y(o, nil) }, WriteOpts{})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := copyDir()
+			s := openStore(t, dir) // syncs
+			if err := write(s); err != nil {
+				t.Fatal(err)
+			}
+			// Finishing the seal is what fsyncs that file, and renames it.
+			if _, err := os.Stat(filepath.Join(dir, segmentName(1, activeSuffix))); err == nil && !ownCopy(s, o.Key) {
+				t.Fatal("acknowledged, and the only copy is in a crashed seal nobody fsynced")
+			}
+			got, err := s.Get(o.Key)
+			if err != nil || !bytes.Equal(got, o.Data) {
+				t.Fatalf("Get = %d bytes, %v", len(got), err)
+			}
+		})
+	}
+	// What PutVerified finds it finishes, and relies on: no second copy.
+	t.Run("PutVerified finishes the seal", func(t *testing.T) {
+		dir := copyDir()
+		s := openStore(t, dir)
+		if err := s.PutVerified(o.Key, o.Data); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, segmentName(1, sealedSuffix))); err != nil {
+			t.Errorf("the seal is not finished: %v", err)
+		}
+		if ownCopy(s, o.Key) {
+			t.Error("wrote a second copy of what it could finish and rely on")
+		}
+	})
+	// A store that does not sync promises nothing, and need not write a second copy.
+	t.Run("a store that does not sync", func(t *testing.T) {
+		s := openStore(t, copyDir(), WithSync(false))
+		if err := s.Put(o.Key, o.Data); err != nil {
+			t.Fatal(err)
+		}
+		if ownCopy(s, o.Key) {
+			t.Error("wrote a second copy, with nothing to gain")
+		}
+	})
+}
+
+// A failed fsync at adoption: the store keeps nothing of the segment and is out of
+// action, and the segment is free for the next one.
+func TestAFailedAdoptionFsyncPoisonsTheStore(t *testing.T) {
+	objs := testObjects(t, 2)
+	dir := killedWriter(t, objs)
+	s := openStore(t, dir)
+	boom := errors.New("boom")
+	s.beforeAdoptSync = func() error { return boom }
+	if err := s.Put(objs[0].Key, objs[0].Data); !errors.Is(err, boom) {
+		t.Fatalf("Put = %v, want the fsync's error", err)
+	}
+	if s.active != nil {
+		t.Error("the store took the segment anyway")
+	}
+	// The store stays out of action for writes, as after any failed fsync: the
+	// disk may have dropped what it failed to write, so a retry proves nothing.
+	s.beforeAdoptSync = nil
+	if err := s.Put(objs[1].Key, objs[1].Data); !errors.Is(err, boom) {
+		t.Errorf("Put after the failure = %v", err)
+	}
+	// And it let go of the segment's lock: the next store adopts it rather than make
+	// one of its own.
+	other := openStore(t, dir)
+	if err := other.Put(objs[0].Key, objs[0].Data); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := filepath.Base(other.active.path), segmentName(1, activeSuffix); got != want {
+		t.Errorf("the next store wrote to %s, not %s: the failed one kept its lock", got, want)
+	}
+}
+
+// A crashed seal somebody else has hold of is being finished by them, and may not be
+// fsynced yet. PutVerified writes its own copy rather than rely on it.
+func TestACrashedSealHeldBySomebodyIsNotReliedOn(t *testing.T) {
+	objs := testObjects(t, 2)
+	src := t.TempDir()
+	w, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for _, o := range objs {
+		if err := w.PutVerifiedDeferred(o.Key, o.Data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.afterFooter = func() error { return errors.New("killed") }
+	w.appendMu.Lock()
+	err = w.sealActiveLocked()
+	w.appendMu.Unlock()
+	if err == nil {
+		t.Fatal("the seal went through")
+	}
+	path := filepath.Join(src, segmentName(1, activeSuffix))
+	// w still holds the file's lock, as a writer in the middle of finishing would.
+	s := openStore(t, src)
+	if err := s.PutVerified(objs[0].Key, objs[0].Data); err != nil {
+		t.Fatal(err)
+	}
+	if !ownCopy(s, objs[0].Key) {
+		t.Fatal("acknowledged against a crashed seal somebody else holds")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("it finished a seal somebody else holds: %v", err)
+	}
+}
+
+// Nor does a repair rewrite one: it is somebody else's to finish.
+func TestARepairLeavesACrashedSealSomebodyHolds(t *testing.T) {
+	objs := testObjects(t, 2)
+	src := t.TempDir()
+	w, err := Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for _, o := range objs {
+		if err := w.PutVerifiedDeferred(o.Key, o.Data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.afterFooter = func() error { return errors.New("killed") }
+	w.appendMu.Lock()
+	err = w.sealActiveLocked()
+	w.appendMu.Unlock()
+	if err == nil {
+		t.Fatal("the seal went through")
+	}
+	// Its copy is damaged, which a repair would fix if it were this store's to rewrite.
+	path := filepath.Join(src, segmentName(1, activeSuffix))
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before[int64(len(magicHeader))+amberpack.RecHeaderSize] ^= 0x40
+	if err := os.WriteFile(path, before, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A damaged copy of the same object in this store's own segment takes PutVerified
+	// down its repair path, with the crashed seal in view.
+	s := openStore(t, src)
+	if err := s.Put(objs[0].Key, []byte("wrong")); err != nil {
+		t.Fatal(err)
+	}
+	if !ownCopy(s, objs[0].Key) {
+		t.Fatal("no copy of its own to repair")
+	}
+	if err := s.PutVerified(objs[0].Key, objs[0].Data); err != nil {
+		t.Fatal(err)
+	}
+	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
+		t.Fatalf("a repair rewrote a crashed seal somebody holds (%v)", err)
+	}
+	if got, err := s.Get(objs[0].Key); err != nil || !bytes.Equal(got, objs[0].Data) {
+		t.Fatalf("Get = %d bytes, %v", len(got), err)
+	}
 }

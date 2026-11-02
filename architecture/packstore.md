@@ -167,7 +167,9 @@ writer that can use it; a writer at version 2 adopts any.
 A store that syncs fsyncs a segment it adopts, once, when recovery finds records
 past what the sidecar knows durable: a writer that died may have left an unsynced
 tail, and from here on this store acknowledges what its own index holds. One that
-adopts what a writer synced or closed cleanly pays nothing.
+adopts what a writer synced or closed cleanly pays nothing. A seal whose writer died
+before the rename may be just as unsynced, so a store that syncs writes its own copy
+rather than acknowledge against one, until somebody has finished the seal.
 
 **Creating** a segment with an id above every id in the directory:
 
