@@ -269,36 +269,46 @@ func (c *Collector) markLive(ctx context.Context, roots []key.Key) (*packstore.M
 }
 
 // markFrom prunes at already-marked keys, so shared subtrees are walked
-// once. Blob and xattr payloads are marked without being read.
+// once. Blob and xattr payloads are marked without being read, and so are git
+// blobs a tree or tag says are blobs.
+//
+// A git key cannot prune on the mark alone. The mark may come from a link that
+// called it a blob, while this link calls it a directory: what lies below has to
+// stay. So a git key has a second bit, set when its links are followed. Only git
+// keys need one: for every other type, the key itself says whether it is a leaf.
 func (c *Collector) markFrom(ctx context.Context, live *packstore.MarkSet, root key.Key) error {
-	stack := []key.Key{root}
+	stack := []fstree.Link{fstree.LinkTo(root)}
 	for n := 0; len(stack) > 0; n++ {
 		if n%1024 == 0 {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 		}
-		k := stack[len(stack)-1]
+		l := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
+		k := l.Key
 		newly, present := live.Mark(k)
 		if !present {
 			return fmt.Errorf("gc: mark: object %s missing from store", k)
 		}
-		if !newly {
+		if l.Leaf {
 			continue
 		}
-		if k.Type() == key.Blob || k.Type() == key.XattrSet {
+		if k.Type() == key.GitSHA1 {
+			newly = live.MarkWalked(k)
+		}
+		if !newly {
 			continue
 		}
 		data, err := c.objects.Get(k)
 		if err != nil {
 			return err
 		}
-		children, err := fstree.ChildKeys(k, data)
+		links, err := fstree.Links(k, data)
 		if err != nil {
 			return err
 		}
-		stack = append(stack, children...)
+		stack = append(stack, links...)
 	}
 	return nil
 }

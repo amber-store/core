@@ -597,3 +597,27 @@ func TestGoldenVectorConflicted(t *testing.T) {
 		}
 	}
 }
+
+// A store's Commit names the store's own objects. A git key may not stand in for
+// any of them: a git tree has none of the entries a store's directory has, and
+// the file operations a commit promises would have nothing to read.
+func TestCommitRefusesGitKeys(t *testing.T) {
+	git := key.NewGitSHA1([key.GitSHA1Size]byte{1})
+	for name, edit := range map[string]func(c *commit.Commit){
+		"as tree":          func(c *commit.Commit) { c.Tree = git },
+		"as parent":        func(c *commit.Commit) { c.Parents = []key.Key{git} },
+		"as conflict term": func(c *commit.Commit) { c.ConflictTerms = []key.Key{git, git} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := commit.Commit{Tree: emptyDir(t), Author: ann, Committer: ann, Message: "m"}
+			edit(&c)
+			_, _, err := c.Object()
+			if err == nil {
+				t.Fatal("Object took a git key")
+			}
+			if !strings.Contains(err.Error(), "GitSHA1") {
+				t.Errorf("refused for something else: %v", err)
+			}
+		})
+	}
+}

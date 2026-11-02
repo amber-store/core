@@ -212,7 +212,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("packstore: %s is held by an older release, which needs the store to itself: %w", dir, err)
 	}
 	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1, writes: make(map[*writeToken]time.Time)}
-	s.segVersion = versionFor(byte(cfg.compression.Algorithm))
+	s.segVersion = versionForCodec(byte(cfg.compression.Algorithm))
 	s.scrubC = sync.NewCond(&s.scrubMu)
 	if s.gate, err = openGate(dir, s.refresh); err != nil {
 		dirF.Close()
@@ -268,10 +268,10 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	if s.failed != nil {
 		return s.failed
 	}
-	// An lz4 record goes into a segment at versionLZ4 only, and a store that
-	// has written one stays at that version: it leaves a segment early once,
-	// not once per segment.
-	need := versionFor(rec[33])
+	// An lz4 record goes into a segment at versionLZ4 or above and a git record
+	// into one at versionGit, and a store that has written one stays at that
+	// version: it leaves a segment early once, not once per segment.
+	need := versionFor(k, rec[33])
 	s.segVersion = max(s.segVersion, need)
 	var a *activeSegment
 	for {

@@ -151,7 +151,7 @@ func (s *Store) repairSegment(seg *sealedSegment, k key.Key, replacement []byte)
 	defer file.Close()
 	// The rewritten segment keeps its version, raised when the replacement
 	// is a record that the old one may not hold.
-	if _, err := file.Write(headerAt(max(seg.version(), versionFor(replacement[33])))); err != nil {
+	if _, err := file.Write(headerAt(max(seg.version(), versionFor(k, replacement[33])))); err != nil {
 		return err
 	}
 	offset := int64(len(magicHeader))

@@ -14,13 +14,17 @@ import (
 // Size is the fixed byte length of every key.
 const Size = 32
 
+// GitSHA1Size is the byte length of the SHA-1 a GitSHA1 key holds.
+const GitSHA1Size = 20
+
 // Key is a 32-byte lookup key. It is a value type and is directly comparable,
 // so it can be used as a Go map key. Accessors assume the key is canonical
 // (produced by New, NewFromHash, or Parse).
 //
 // The bytes are the (header, length, hash) encoding of architecture/keys.md
 // reversed: the truncated hash comes first and the header byte last, so keys
-// sort and bucket uniformly on their leading bytes.
+// sort and bucket uniformly on their leading bytes. A GitSHA1 key has a layout
+// of its own, see NewGitSHA1.
 type Key [Size]byte
 
 // headerAt is the index of the header byte: the last one.
@@ -44,9 +48,13 @@ func (k Key) Length() uint64 {
 	return binary.LittleEndian.Uint64(buf[:])
 }
 
-// Hash returns the truncated payload hash (len == Size-1-LengthSize) in digest
-// order, a copy: the key stores it reversed.
+// Hash returns the payload hash in digest order, a copy. For a BLAKE3 key that
+// is the truncated digest (len == Size-1-LengthSize), which the key stores
+// reversed; for a GitSHA1 key it is the SHA-1, GitSHA1Size bytes.
 func (k Key) Hash() []byte {
+	if k.Type() == GitSHA1 {
+		return bytes.Clone(k[:GitSHA1Size])
+	}
 	h := bytes.Clone(k[:headerAt-k.LengthSize()])
 	slices.Reverse(h)
 	return h
@@ -63,15 +71,40 @@ func lengthSizeFor(length uint64) int {
 
 // New computes the BLAKE3-256 digest of serialized, then assembles a canonical
 // key via NewFromHash. length is the logical payload length and is taken as
-// given (it need not equal len(serialized) — see NewFromHash).
+// given (it need not equal len(serialized) — see NewFromHash). A GitSHA1 key is
+// not made here: see NewGitSHA1.
 func New(t Type, length uint64, serialized []byte) (Key, error) {
 	return NewFromHash(t, length, blake3.Sum256(serialized))
 }
 
+// NewGitSHA1 assembles the key of a git object from its SHA-1. The layout is
+// not the reversed one: the SHA-1 comes first, in digest order, so a key's hex
+// starts with the object's git id and keys sort as git ids do. Then come ten
+// zero bytes, the length (a git object's id does not tell its size, so a key
+// made from a link in another object could not hold one: it is always zero)
+// and the header. See architecture/keys.md.
+func NewGitSHA1(sum [GitSHA1Size]byte) Key {
+	var k Key
+	copy(k[:], sum[:])
+	k[headerAt] = byte(GitSHA1) << 4
+	return k
+}
+
+// GitSHA1Sum returns the SHA-1 a GitSHA1 key holds. ok is false for a key of
+// any other type.
+func (k Key) GitSHA1Sum() (sum [GitSHA1Size]byte, ok bool) {
+	if k.Type() != GitSHA1 {
+		return sum, false
+	}
+	copy(sum[:], k[:])
+	return sum, true
+}
+
 // Validate reports whether k is canonical: the reserved bit is clear, the type
-// is defined (0..5), and the length field is minimally encoded (its most
+// is defined (0..6), the length field is minimally encoded (its most
 // significant byte, the one next to the header, is non-zero, except for the
-// single 0x00 byte that encodes a zero length).
+// single 0x00 byte that encodes a zero length), and a GitSHA1 key has nothing
+// but zeros after its SHA-1, so that one git object has one key.
 func (k Key) Validate() error {
 	if k[headerAt]&0x08 != 0 {
 		return ErrReservedBitSet
@@ -82,7 +115,24 @@ func (k Key) Validate() error {
 	if k[headerAt-1] == 0 && !(k.LengthSize() == 1 && k.Length() == 0) {
 		return ErrNonCanonicalLength
 	}
+	if k.Type() == GitSHA1 && !isGitTail(k) {
+		return ErrNonCanonicalGitKey
+	}
 	return nil
+}
+
+// isGitTail reports whether everything between k's SHA-1 and its type is zero:
+// the padding, the length and the length size.
+func isGitTail(k Key) bool {
+	if k[headerAt]&0x07 != 0 {
+		return false
+	}
+	for _, b := range k[GitSHA1Size:headerAt] {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Parse copies b into a Key and validates its canonical form. b must be exactly
@@ -110,10 +160,13 @@ func (k Key) String() string {
 // byte-reversed (see Key). length is used verbatim: for
 // Blob/XattrSet it is the serialized byte length; for FileNode/DirLeaf/DirNode
 // and Commit it is a logical size (see architecture/types.md). Returns ErrReservedType
-// if t is not a defined type.
+// if t is not a defined type and ErrNotBlake3 if it is GitSHA1.
 func NewFromHash(t Type, length uint64, fullHash [Size]byte) (Key, error) {
 	if !t.IsValid() {
 		return Key{}, fmt.Errorf("%w: %d", ErrReservedType, uint8(t))
+	}
+	if t == GitSHA1 {
+		return Key{}, fmt.Errorf("%w: %v", ErrNotBlake3, t)
 	}
 	ls := lengthSizeFor(length)
 	var k Key

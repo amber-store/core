@@ -16,12 +16,13 @@ const (
 	DirNode  Type = 3 // directory index node
 	XattrSet Type = 4 // spilled extended attributes
 	Commit   Type = 5 // snapshot record: tree, parent commits, author, committer, message
+	GitSHA1  Type = 6 // a git object, addressed by its SHA-1 (architecture/git-objects.md)
 )
 
-// IsValid reports whether t is a defined CAS object type (0..5). Types 6..15 are
+// IsValid reports whether t is a defined CAS object type (0..6). Types 7..15 are
 // reserved and must not be emitted; values above 15 do not fit the 4-bit field.
 func (t Type) IsValid() bool {
-	return t <= Commit
+	return t <= GitSHA1
 }
 
 // String returns the type name, or "Type(n)" for reserved/unknown values.
@@ -39,6 +40,8 @@ func (t Type) String() string {
 		return "XattrSet"
 	case Commit:
 		return "Commit"
+	case GitSHA1:
+		return "GitSHA1"
 	default:
 		return fmt.Sprintf("Type(%d)", uint8(t))
 	}

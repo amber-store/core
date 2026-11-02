@@ -161,30 +161,27 @@ func (c *Collector) UnreachableFrom(ctx context.Context, roots, candidates []key
 
 // reaches walks root's tree until k is found, pruning revisited subtrees.
 func (c *Collector) reaches(root, k key.Key) (bool, error) {
-	visited := map[key.Key]bool{}
-	stack := []key.Key{root}
+	read := map[key.Key]bool{}
+	stack := []fstree.Link{fstree.LinkTo(root)}
 	for len(stack) > 0 {
 		cur := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if cur == k {
+		if cur.Key == k {
 			return true, nil
 		}
-		if visited[cur] {
+		if cur.Leaf || read[cur.Key] {
 			continue
 		}
-		visited[cur] = true
-		if cur.Type() == key.Blob || cur.Type() == key.XattrSet {
-			continue
-		}
-		data, err := c.objects.Get(cur)
+		read[cur.Key] = true
+		data, err := c.objects.Get(cur.Key)
 		if err != nil {
 			return false, err
 		}
-		children, err := fstree.ChildKeys(cur, data)
+		links, err := fstree.Links(cur.Key, data)
 		if err != nil {
 			return false, err
 		}
-		stack = append(stack, children...)
+		stack = append(stack, links...)
 	}
 	return false, nil
 }

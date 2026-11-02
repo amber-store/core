@@ -16,6 +16,11 @@ type MarkSet struct {
 	bits   [][]uint64
 	active map[key.Key]bool // present in active segment, value = marked
 	marked int              // keys marked so far
+
+	// What MarkWalked records, apart from the mark. Allocated when first used:
+	// a store without git objects pays nothing for it.
+	walked       [][]uint64
+	activeWalked map[key.Key]bool
 }
 
 func (s *Store) NewMarkSet() *MarkSet {
@@ -81,6 +86,38 @@ func (m *MarkSet) Mark(k key.Key) (newly, present bool) {
 		m.marked++
 	}
 	return newly, true
+}
+
+// MarkWalked records that a walk follows k's links, reporting whether it is the
+// first to. It is apart from Mark because an object can be marked without being
+// read: a git key is marked through a link that calls it a blob, and may still
+// be named as a directory by another. It reports false for a key that is not in
+// the snapshot.
+func (m *MarkSet) MarkWalked(k key.Key) (first bool) {
+	seg, pos, inActive, ok := m.locate(k)
+	if !ok {
+		return false
+	}
+	if inActive {
+		if m.activeWalked[k] {
+			return false
+		}
+		if m.activeWalked == nil {
+			m.activeWalked = map[key.Key]bool{}
+		}
+		m.activeWalked[k] = true
+		return true
+	}
+	if m.walked == nil {
+		m.walked = make([][]uint64, len(m.segs))
+	}
+	if m.walked[seg] == nil {
+		m.walked[seg] = make([]uint64, len(m.bits[seg]))
+	}
+	w, b := &m.walked[seg][pos/64], uint64(1)<<(pos%64)
+	first = *w&b == 0
+	*w |= b
+	return first
 }
 
 func (m *MarkSet) Contains(k key.Key) bool {
