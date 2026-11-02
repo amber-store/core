@@ -62,6 +62,14 @@ func (s *Store) ensureActiveLocked() error {
 		return err
 	}
 	s.removeStaleTemporaries(ls.tmp)
+	// What a Compact's own segment holds stands in for a victim's copy, because the pass
+	// verified it. One that somebody left while it ran holds what nobody verified, and
+	// may be a victim the pass is reading: a crashed seal, which adopting would finish
+	// and unmap. And lookups read the newest id first, so a copy must not go under an id
+	// below a pack that survives with a bad copy of the same key: it takes a new one.
+	if s.copying {
+		return s.createActive(ls.maxID)
+	}
 	cands := make([]segFile, 0, len(ls.active))
 	ids := map[string]uint64{}
 	for id, sf := range ls.active {
@@ -385,11 +393,11 @@ func (s *Store) leaveActiveLocked() error {
 	return nil
 }
 
-// sealIdleLocked seals every active segment that no writer holds. A small
-// store's segments never fill, and the process that wrote them may be long
-// gone: without this nothing in them could ever be collected. A segment a
-// live writer holds is left alone; an active segment is never a victim.
-// Called by Compact under appendMu, after it sealed the store's own segment.
+// sealIdleLocked seals every active segment that no writer holds, and lets go of
+// those with nothing in them. A small store's segments never fill, and the process
+// that wrote them may be long gone: without this nothing in them could ever be
+// collected. A segment a live writer holds is left alone, and is no victim. Called
+// by Compact under appendMu, after it sealed the store's own segment.
 func (s *Store) sealIdleLocked() error {
 	if s.active != nil {
 		// Still owned, so empty: sealing left it alone. Let go of it for the
@@ -400,26 +408,16 @@ func (s *Store) sealIdleLocked() error {
 	if err != nil {
 		return err
 	}
-	ids := make([]uint64, 0, len(ls.active))
-	for id := range ls.active {
-		ids = append(ids, id)
-	}
-	slices.SortFunc(ids, func(a, b uint64) int { // the fullest first: the empty ones cannot be sealed
-		return cmp.Or(cmp.Compare(ls.active[b].info.Size(), ls.active[a].info.Size()), cmp.Compare(a, b))
-	})
-	for _, id := range ids {
-		adopted, err := s.adopt(id, ls.active[id].path, versionBase) // whatever its version: it is to be sealed
+	for id, sf := range ls.active {
+		adopted, err := s.adopt(id, sf.path, versionBase) // whatever its version: it is to be sealed
 		if err != nil {
 			return err
 		}
 		if !adopted {
 			continue
 		}
-		if err := s.sealActiveLocked(); err != nil {
+		if err := s.leaveActiveLocked(); err != nil {
 			return err
-		}
-		if s.active != nil {
-			return nil // an empty one: the pass appends its survivors to it
 		}
 	}
 	return nil

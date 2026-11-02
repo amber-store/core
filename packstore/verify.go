@@ -14,7 +14,9 @@ import (
 )
 
 // ErrVerify is returned (wrapped) when an object's key does not match its
-// payload. Callers distinguish it with errors.Is to map to a client error.
+// payload. Callers distinguish it with errors.Is to map to a client error. Bytes
+// the store already held that fail the same check are its own damage, and wrap
+// ErrCorrupt as well (Verify, GetVerified): look for that one first.
 var ErrVerify = errors.New("packstore: object verification failed")
 
 // Verify scrubs every sealed segment: walks the body record by record
@@ -95,28 +97,36 @@ func (g *sealedSegment) verify(ctx context.Context) error {
 	return nil
 }
 
-// verifyObject recomputes o.Key from o.Data and reports ErrVerify on mismatch.
-// For Blob and XattrSet, whose key length is the serialized byte length, it
-// also checks the length field; and for Commit, whose length is a footprint —
-// own bytes plus the trees it records — which the commit's own bytes suffice
-// to recompute. A commit that does not decode fails verification. The other
-// aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the store
-// does not recompute, so only their hash is checked. A git object is held to
-// its SHA-1 instead, and to its frame (gitobj.Verify).
-func verifyObject(o Object) error {
-	if o.Key.Type() == key.GitSHA1 {
-		if err := gitobj.Verify(o.Key, o.Data); err != nil {
-			return fmt.Errorf("%w: %s: %w", ErrVerify, o.Key, err)
+// verifyHash reports ErrVerify unless data hashes to k: that the bytes are what the
+// key says. A git object is held to its SHA-1, and to its frame (gitobj.Verify).
+func verifyHash(k key.Key, data []byte) error {
+	if k.Type() == key.GitSHA1 {
+		if err := gitobj.Verify(k, data); err != nil {
+			return fmt.Errorf("%w: %s: %w", ErrVerify, k, err)
 		}
 		return nil
 	}
-	sum := blake3.Sum256(o.Data)
-	want, err := key.NewFromHash(o.Key.Type(), o.Key.Length(), sum)
+	sum := blake3.Sum256(data)
+	want, err := key.NewFromHash(k.Type(), k.Length(), sum)
 	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrVerify, o.Key, err)
+		return fmt.Errorf("%w: %s: %v", ErrVerify, k, err)
 	}
-	if want != o.Key {
-		return fmt.Errorf("%w: payload hashes to %s, not %s", ErrVerify, want, o.Key)
+	if want != k {
+		return fmt.Errorf("%w: payload hashes to %s, not %s", ErrVerify, want, k)
+	}
+	return nil
+}
+
+// verifyObject recomputes o.Key from o.Data and reports ErrVerify on mismatch
+// (verifyHash). For Blob and XattrSet, whose key length is the serialized byte
+// length, it also checks the length field; and for Commit, whose length is a
+// footprint — own bytes plus the trees it records — which the commit's own bytes
+// suffice to recompute. A commit that does not decode fails verification. The other
+// aggregate types (FileNode/DirLeaf/DirNode) carry a logical length the store does
+// not recompute, so only their hash is checked.
+func verifyObject(o Object) error {
+	if err := verifyHash(o.Key, o.Data); err != nil {
+		return err
 	}
 	switch o.Key.Type() {
 	case key.Blob, key.XattrSet:

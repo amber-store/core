@@ -134,7 +134,7 @@ func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
 // prepare is the work of a reference PUT under the reference lock: the
 // completeness walk, and the walked closure handed to the write barrier.
 func (c *Collector) prepare(root key.Key) error {
-	keys, err := fstree.CheckComplete(root, c.objects.Get, c.objects.Has, c.opts.Jobs)
+	keys, err := fstree.CheckComplete(root, c.objects.GetVerified, c.objects.Has, c.opts.Jobs)
 	if err != nil {
 		return fmt.Errorf("gc: walking root %s: %w", root, err)
 	}
@@ -269,8 +269,8 @@ func (c *Collector) markLive(ctx context.Context, roots []key.Key) (*packstore.M
 }
 
 // markFrom prunes at already-marked keys, so shared subtrees are walked
-// once. Blob and xattr payloads are marked without being read, and so are git
-// blobs a tree or tag says are blobs.
+// once. What it reads it verifies. Blob and xattr payloads are marked without being
+// read, and so are git blobs a tree or tag says are blobs.
 //
 // A git key cannot prune on the mark alone. The mark may come from a link that
 // called it a blob, while this link calls it a directory: what lies below has to
@@ -300,7 +300,10 @@ func (c *Collector) markFrom(ctx context.Context, live *packstore.MarkSet, root 
 		if !newly {
 			continue
 		}
-		data, err := c.objects.Get(k)
+		// Verified, because the mark decides what is deleted: a bad directory can
+		// still decode, and walks as a smaller one, and whatever it no longer names
+		// would be swept.
+		data, err := c.objects.GetVerified(k)
 		if err != nil {
 			return err
 		}

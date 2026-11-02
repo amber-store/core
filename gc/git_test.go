@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/fstree"
 	"github.com/amber-store/core/gitobj"
 	"github.com/amber-store/core/key"
@@ -586,4 +587,57 @@ func TestPrepareRefGitSubmoduleIsNotRequired(t *testing.T) {
 		t.Fatalf("PrepareRef: %v", err)
 	}
 	commit()
+}
+
+// A git key does not say it is a blob, so only a verified mark lets the cycle go on
+// past a bad one. A git store gets the same as any other: one bad file costs one pack.
+func TestABadGitBlobDoesNotStopCollection(t *testing.T) {
+	ts := newTestStore(t, 2<<10)
+	c := ts.openCollector(t, Options{Grace: time.Hour})
+	data := gitobj.Encode(gitobj.Blob, []byte("hello\n"))
+	blob, err := gitobj.KeyOf(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.objects.PutVerified(blob, data); err != nil {
+		t.Fatal(err)
+	}
+	tree := storeGit(t, ts.objects, gitobj.Tree, gitEntry(t, "100644", "f", blob))
+	tip := storeGit(t, ts.objects, gitobj.Commit, "tree "+oidOf(t, tree)+"\n")
+	var dead []key.Key
+	for i := range 40 {
+		dead = append(dead, storeGit(t, ts.objects, gitobj.Blob, fmt.Sprintf("%0400d", i)))
+	}
+	putTestRef(t, c, ts.refs, "main", tip)
+	// The blob is the first record of the first pack.
+	p := filepath.Join(ts.dir, "packstore", "0000000000000001.seg")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[8+amberpack.RecHeaderSize] ^= 0x40
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backdatePacks(t, ts)
+	stats, err := c.Run(context.Background(), 0)
+	if !errors.Is(err, packstore.ErrCorrupt) {
+		t.Fatalf("Run = %v, want ErrCorrupt", err)
+	}
+	if len(stats.Skipped) != 1 || stats.Skipped[0].Key != blob {
+		t.Fatalf("Skipped = %+v", stats.Skipped)
+	}
+	if countGone(t, ts.objects, dead) == 0 {
+		t.Fatal("collection stopped")
+	}
+	if err := ts.objects.PutVerified(blob, data); err != nil {
+		t.Fatal(err)
+	}
+	backdatePacks(t, ts)
+	if _, err := c.Run(context.Background(), 0); err != nil {
+		t.Fatalf("after the repair: %v", err)
+	}
+	if _, err := fstree.CheckComplete(tip, ts.objects.GetVerified, ts.objects.Has, 1); err != nil {
+		t.Fatalf("after a cycle: %v", err)
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/amber-store/core/amberpack"
@@ -276,6 +277,27 @@ func TestSegmentsFollowsASealAnotherStoreFinished(t *testing.T) {
 	}
 }
 
+// Once the view knows the seal is finished, it is a sealed segment like any other: a
+// write relies on it rather than make another copy.
+func TestAFinishedSealCountsOnceTheViewKnows(t *testing.T) {
+	objs := testObjects(t, 2)
+	dir, _ := crashedSealIn(t, objs)
+	s := openStore(t, dir)
+	other := openStore(t, dir)
+	if err := other.PutVerified(objs[0].Key, objs[0].Data); err != nil { // finishes the seal
+		t.Fatal(err)
+	}
+	if err := s.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(objs[1].Key, objs[1].Data); err != nil {
+		t.Fatal(err)
+	}
+	if ownCopy(s, objs[1].Key) {
+		t.Error("a second copy, beside a sealed segment that holds it durably")
+	}
+}
+
 // A crashed seal's name moves under a view. Run with -race: a refresh learns of it while
 // repairs and duplicate checks ask.
 func TestACrashedSealsNameIsReadSafelyDuringARefresh(t *testing.T) {
@@ -305,4 +327,24 @@ func TestACrashedSealsNameIsReadSafelyDuringARefresh(t *testing.T) {
 	}
 	close(stop)
 	<-done
+}
+
+// The ordinary seal: its footer's fsync is what every record in the segment now rests on.
+func TestAFailedFsyncSealingPoisonsTheStore(t *testing.T) {
+	objs := testObjects(t, 2)
+	s := openStore(t, t.TempDir())
+	if err := s.Put(objs[0].Key, objs[0].Data); err != nil {
+		t.Fatal(err)
+	}
+	s.beforeFsync = func(*os.File) error { return errors.New("EIO") }
+	s.appendMu.Lock()
+	err := s.sealActiveLocked()
+	s.appendMu.Unlock()
+	if err == nil {
+		t.Fatal("the seal went through")
+	}
+	s.beforeFsync = nil
+	if err := s.Put(objs[1].Key, objs[1].Data); err == nil || !strings.Contains(err.Error(), "EIO") {
+		t.Fatalf("Put after a failed seal = %v", err)
+	}
 }

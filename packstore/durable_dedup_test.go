@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/amber-store/core/amberpack"
@@ -454,14 +455,58 @@ func TestARepairLeavesACrashedSealSomebodyHolds(t *testing.T) {
 	if !ownCopy(s, objs[0].Key) {
 		t.Fatal("no copy of its own to repair")
 	}
-	if err := s.PutVerified(objs[0].Key, objs[0].Data); err != nil {
-		t.Fatal(err)
+	// It answers for every copy, and cannot reach that one: saying nothing would be a lie.
+	if err := s.PutVerified(objs[0].Key, objs[0].Data); err == nil || !strings.Contains(err.Error(), "another store holds") {
+		t.Fatalf("PutVerified = %v", err)
 	}
 	if after, err := os.ReadFile(path); err != nil || !bytes.Equal(after, before) {
 		t.Fatalf("a repair rewrote a crashed seal somebody holds (%v)", err)
 	}
-	if got, err := s.Get(objs[0].Key); err != nil || !bytes.Equal(got, objs[0].Data) {
-		t.Fatalf("Get = %d bytes, %v", len(got), err)
+	// Once its holder has let go, the same call finishes the seal and repairs it.
+	w.Close()
+	if err := s.PutVerified(objs[0].Key, objs[0].Data); err != nil {
+		t.Fatal(err)
+	}
+	if !segExists(t, src, 1) {
+		t.Fatal("nobody finished the seal")
+	}
+	if got, err := s.GetVerified(objs[0].Key); err != nil || !bytes.Equal(got, objs[0].Data) {
+		t.Fatalf("GetVerified = %d bytes, %v", len(got), err)
+	}
+}
+
+// A good copy elsewhere must not hide it: lookups read the higher id first.
+func TestPutVerifiedDoesNotAcknowledgeBesideABadHeldCrashedSeal(t *testing.T) {
+	objs := testObjects(t, 2)
+	dir := t.TempDir()
+	sealedFile(t, dir, 1, objs[0])
+	w, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	for _, o := range objs {
+		rec, err := amberpack.EncodeRecord(o.Key, o.Data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.append(o.Key, rec, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path, off := w.active.path, w.active.index[objs[0].Key].off
+	w.afterFooter = func() error { return errors.New("killed") }
+	w.appendMu.Lock()
+	err = w.sealActiveLocked()
+	w.appendMu.Unlock()
+	if err == nil {
+		t.Fatal("the seal went through")
+	}
+	flipByte(t, path, off+amberpack.RecHeaderSize)
+	s := openStore(t, dir)
+	if err := s.PutVerified(objs[0].Key, objs[0].Data); err == nil {
+		got, verr := s.GetVerified(objs[0].Key)
+		t.Fatalf("PutVerified acknowledged, and GetVerified = %d bytes, %v", len(got), verr)
 	}
 }
 

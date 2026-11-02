@@ -24,12 +24,13 @@ type CycleStats struct {
 	MarkDuration  time.Duration // roots snapshot + mark walk
 	SweepDuration time.Duration // Compact: select, copy, delete
 	Threshold     float64
-	Marked        int      // distinct live objects marked
-	Scored        int      // sealed packs considered
-	Reaped        []uint64 // victim ids, ascending
+	Marked        int                        // distinct live objects marked
+	Scored        int                        // sealed packs considered
+	Reaped        []uint64                   // ids of the packs removed, ascending
+	Skipped       []packstore.SkippedSegment // packs left in place for a bad live record
 	CopiedRecords int
 	CopiedBytes   int64
-	FreedBytes    int64 // victim file bytes freed on disk, footers included
+	FreedBytes    int64 // removed file bytes freed on disk, footers included
 }
 
 // Run marks from every reference root and sweeps the eligible packs above
@@ -37,6 +38,12 @@ type CycleStats struct {
 // or 0.1 under min-free pressure. Ingests and reads run through the mark
 // (the write barrier keeps them); reference publication and the sweep
 // stall each other on the reference lock.
+//
+// A live record that fails verification keeps its pack, and the cycle frees what else
+// it can: Run returns a *packstore.SkippedError beside stats that say what it did. A
+// bad record in an object the mark has to read stops the cycle instead, with nothing
+// freed: what it reaches cannot be known. The mark verifies what it reads, so a bad
+// object cannot hide what it refers to.
 func (c *Collector) Run(ctx context.Context, garbage float64) (CycleStats, error) {
 	return c.run(ctx, garbage, nil)
 }
@@ -145,6 +152,7 @@ func (c *Collector) cycle(ctx context.Context, garbage float64, maxCopyBytes *ui
 		MinDeadRatio: threshold,
 		Horizon:      time.Now().Add(-c.opts.Grace),
 		MaxCopyBytes: maxCopyBytes,
+		MarkVerified: true,
 	}
 	if c.opts.Rate > 0 {
 		opts.Pace = newThrottle(c.opts.Rate).pace
@@ -154,6 +162,7 @@ func (c *Collector) cycle(ctx context.Context, garbage float64, maxCopyBytes *ui
 	stats.SweepDuration = time.Since(sweepStart)
 	stats.Scored = cs.SegmentsScanned
 	stats.Reaped = cs.Victims
+	stats.Skipped = cs.Skipped
 	stats.CopiedRecords = cs.RecordsCopied
 	stats.CopiedBytes = int64(cs.BytesCopied)
 	stats.FreedBytes = int64(cs.BytesFreed)

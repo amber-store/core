@@ -1,10 +1,12 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/amber-store/core/gc"
+	"github.com/amber-store/core/packstore"
 	"github.com/urfave/cli/v2"
 )
 
@@ -116,14 +118,18 @@ func (cfg *gcRunConfig) runGCRun(c *cli.Context) error {
 	}
 	defer coll.Close()
 	stats, err := coll.Run(c.Context, cfg.garbage)
-	if err != nil {
+	var skipped *packstore.SkippedError
+	if err != nil && !errors.As(err, &skipped) {
 		return err
 	}
 	fmt.Fprintf(c.App.Writer, "%d packs scored, %d reaped, %d records (%s) copied, %s freed in %s (mark %s, sweep %s; %d objects marked)\n",
 		stats.Scored, len(stats.Reaped), stats.CopiedRecords,
 		humanBytes(uint64(stats.CopiedBytes)), humanBytes(uint64(max(stats.FreedBytes, 0))), stats.Duration.Round(time.Millisecond),
 		stats.MarkDuration.Round(time.Millisecond), stats.SweepDuration.Round(time.Millisecond), stats.Marked)
-	return nil
+	if len(stats.Skipped) > 0 {
+		fmt.Fprintf(c.App.Writer, "%d left in place\n", len(stats.Skipped))
+	}
+	return err // a pack left in place is still a failed run
 }
 
 func runGCWhy(c *cli.Context) error {
