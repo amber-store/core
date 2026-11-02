@@ -164,6 +164,11 @@ simultaneous writers and drifts back to one as they fill. A writer that has
 moved to a higher version passes over a segment below it, leaving it for a
 writer that can use it; a writer at version 2 adopts any.
 
+A store that syncs fsyncs a segment it adopts, once, when recovery finds records
+past what the sidecar knows durable: a writer that died may have left an unsynced
+tail, and from here on this store acknowledges what its own index holds. One that
+adopts what a writer synced or closed cleanly pays nothing.
+
 **Creating** a segment with an id above every id in the directory:
 
 1. Create `<id>.seg.active.tmp` with `O_EXCL`. If it exists, another creator
@@ -328,7 +333,9 @@ above:
 - **Survivors are durable before victims are unlinked**: a compaction syncs
   the segment it copied into, then removes the old ones, then syncs the
   directory.
-- **Rely only on durable copies** when skipping a write or a survivor's copy.
+- **Rely only on durable copies** when skipping a write or a survivor's copy. That
+  covers what a segment's own writer holds in its index: fsync an adopted segment's
+  unsynced tail before acknowledging anything against it.
 - **Refuse a segment of a format version other than 2, 3 and 4** and leave it as
   it is; only a header that is missing or not this format's magic at all may
   be reset.

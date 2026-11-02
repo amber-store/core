@@ -800,7 +800,7 @@ func (s *Store) hasDurably(k key.Key) (bool, error) {
 func (s *Store) reliableActiveLocked(k key.Key) bool {
 	if s.active != nil {
 		if _, ok := s.active.index[k]; ok {
-			return true // this store's own fsync covers it
+			return true // this store's own fsync covers it, or did at adoption (adopt)
 		}
 	}
 	for _, fa := range s.foreign {

@@ -174,7 +174,24 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 		f.Close()
 		return false, err
 	}
+	// From here on this store acknowledges what its own index holds, on the
+	// grounds that its own fsync covers it (reliableActiveLocked, appendLocked).
+	// A tail its last writer never synced is not covered by anything yet, and
+	// this one fsync makes the grounds true. A writer that synced or closed
+	// cleanly leaves nothing to do, so a process per command pays nothing.
+	tail := s.cfg.sync && size > max(res.durable, int64(len(magicHeader)))
+	if tail {
+		s.fsyncs.Add(1)
+		if err := f.Sync(); err != nil {
+			s.setFailed(err)
+			f.Close()
+			return false, err
+		}
+	}
 	a := &activeSegment{id: id, path: path, version: version, f: f, size: size, index: res.index, sc: openOwnedSidecar(path, res)}
+	if tail {
+		a.sc.synced(size)
+	}
 	s.mu.Lock()
 	s.structEpoch++
 	s.dropForeignLocked(id)
