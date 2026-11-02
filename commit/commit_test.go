@@ -606,13 +606,17 @@ func TestCommitRefusesGitKeys(t *testing.T) {
 	for name, edit := range map[string]func(c *commit.Commit){
 		"as tree":          func(c *commit.Commit) { c.Tree = git },
 		"as parent":        func(c *commit.Commit) { c.Parents = []key.Key{git} },
-		"as conflict term": func(c *commit.Commit) { c.ConflictTerms = []key.Key{git} },
+		"as conflict term": func(c *commit.Commit) { c.ConflictTerms = []key.Key{git, git} },
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := commit.Commit{Tree: emptyDir(t), Author: ann, Committer: ann, Message: "m"}
 			edit(&c)
-			if _, _, err := c.Object(); err == nil {
-				t.Error("Object took a git key")
+			_, _, err := c.Object()
+			if err == nil {
+				t.Fatal("Object took a git key")
+			}
+			if !strings.Contains(err.Error(), "GitSHA1") {
+				t.Errorf("refused for something else: %v", err)
 			}
 		})
 	}

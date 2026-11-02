@@ -476,6 +476,89 @@ func TestPutVerifiedRefusesTheWrongPayloadUnderAGitKey(t *testing.T) {
 	}
 }
 
+// The promise of architecture/git-objects.md, at each place that makes it: a plain
+// Put verifies nothing, and each of these sees what it wrote.
+func wrongGitPayload(t *testing.T, s *Store) Object {
+	t.Helper()
+	o := gitBlobObj(t, []byte("hello\n"))
+	if err := s.Put(o.Key, []byte("blob 6\x00hullo\n")); err != nil {
+		t.Fatal(err)
+	}
+	return o
+}
+
+func TestCompactionRefusesAWrongGitPayload(t *testing.T) {
+	s, err := Open(t.TempDir(), WithSync(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	o := wrongGitPayload(t, s)
+	dead := gitBlobObj(t, []byte("dead\n"))
+	if err := s.Put(dead.Key, dead.Data); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.Compact(func(k key.Key) bool { return k == o.Key }, CompactOpts{})
+	if !errors.Is(err, ErrVerify) {
+		t.Fatalf("Compact = %v, want ErrVerify", err)
+	}
+	if ok, err := s.Has(o.Key); err != nil || !ok {
+		t.Fatalf("Has after the refused pass: %v, %v", ok, err)
+	}
+}
+
+func TestScrubRefusesAWrongGitPayload(t *testing.T) {
+	s, err := Open(t.TempDir(), WithSync(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	wrongGitPayload(t, s)
+	if err := s.sealActiveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Verify(context.Background()); !errors.Is(err, ErrVerify) {
+		t.Fatalf("Verify = %v, want ErrVerify", err)
+	}
+}
+
+func TestPutVerifiedReplacesAWrongGitPayload(t *testing.T) {
+	s, err := Open(t.TempDir(), WithSync(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	o := wrongGitPayload(t, s)
+	if err := s.PutVerified(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	mustGet(t, s, o)
+}
+
+func TestWriteParallelRefusesAForgedGitObject(t *testing.T) {
+	o := gitBlobObj(t, []byte("hello\n"))
+	forged := []byte("blob 6\x00hullo\n")
+	rec, err := amberpack.EncodeRecord(o.Key, forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, obj := range map[string]Object{
+		"data":   {Key: o.Key, Data: forged},
+		"record": {Key: o.Key, Record: rec},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := rawStore(t)
+			_, err := s.WriteParallel(objSeq([]Object{obj}, -1), WriteOpts{Verify: true, Writers: 2})
+			if !errors.Is(err, ErrVerify) {
+				t.Fatalf("WriteParallel = %v, want ErrVerify", err)
+			}
+			if ok, err := s.Has(o.Key); err != nil || ok {
+				t.Fatalf("Has after a refused write: %v, %v", ok, err)
+			}
+		})
+	}
+}
+
 func TestCompressionCallbackIsAskedForGitObjects(t *testing.T) {
 	var asked atomic.Int32
 	s := rawStore(t, WithCompressionFor(func(k key.Key, _ []byte, def amberpack.Compression) amberpack.Compression {
@@ -525,5 +608,18 @@ func TestMarkSet_MarkWalked(t *testing.T) {
 	absent := blobObj(t, []byte("never stored"))
 	if m.MarkWalked(absent.Key) {
 		t.Fatal("MarkWalked of an absent key said it was first")
+	}
+	// Walking is no mark, on either kind of segment.
+	fresh := s.NewMarkSet()
+	for i, o := range all {
+		if !fresh.MarkWalked(o.Key) {
+			t.Fatalf("MarkWalked of object %d", i)
+		}
+		if fresh.Contains(o.Key) {
+			t.Fatalf("MarkWalked marked object %d", i)
+		}
+	}
+	if fresh.Marked() != 0 {
+		t.Fatalf("Marked() = %d after walking alone", fresh.Marked())
 	}
 }

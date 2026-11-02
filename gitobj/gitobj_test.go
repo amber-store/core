@@ -230,6 +230,8 @@ func TestLinks_TreeModes(t *testing.T) {
 		{"0", nil},              // anything else git takes for a gitlink as well
 		{"60000", nil},
 		{"7", nil},
+		{"300644", []Link{blob}}, // only the file-type bits count, and only four of them
+		{"240000", []Link{dir}},
 	} {
 		t.Run(c.mode, func(t *testing.T) {
 			wantLinks(t, links(t, Tree, c.mode+" x\x00"+raw(t, oidHello)), c.want...)

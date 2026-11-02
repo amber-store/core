@@ -345,6 +345,44 @@ func TestWhyWalksGitObjects(t *testing.T) {
 	}
 }
 
+// One entry calls an object a file and another a directory: gc why must see below
+// it, whichever it meets first, or it calls a live object unreferenced.
+func TestWhyFollowsAnObjectAlsoNamedAsAFile(t *testing.T) {
+	for _, order := range [][2]string{{"40000", "100644"}, {"100644", "40000"}} {
+		ts := newTestStore(t, 1<<20)
+		c := ts.openCollector(t, Options{})
+		below := storeGit(t, ts.objects, gitobj.Blob, "below\n")
+		sub := storeGit(t, ts.objects, gitobj.Tree, gitEntry(t, "100644", "f", below))
+		top := storeGit(t, ts.objects, gitobj.Tree, gitEntry(t, order[0], "a", sub)+gitEntry(t, order[1], "b", sub))
+		putTestRef(t, c, ts.refs, "main", top)
+		names, err := c.Why(below)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(names, []string{"main"}) {
+			t.Errorf("%v: Why(below) = %v, want [main]", order, names)
+		}
+	}
+}
+
+func TestWhyDoesNotReadGitBlobs(t *testing.T) {
+	ts := newTestStore(t, 1<<20)
+	c := ts.openCollector(t, Options{})
+	unreadable := []byte("not a git object")
+	k, err := gitobj.KeyOf(unreadable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ts.objects.Put(k, unreadable); err != nil {
+		t.Fatal(err)
+	}
+	putTestRef(t, c, ts.refs, "main", storeGit(t, ts.objects, gitobj.Tree, gitEntry(t, "100644", "f", k)))
+	other := storeGit(t, ts.objects, gitobj.Blob, "not in the tree\n")
+	if names, err := c.Why(other); err != nil || len(names) != 0 {
+		t.Errorf("Why read a blob, or found a reference: %v, %v", names, err)
+	}
+}
+
 func oidOf(t *testing.T, k key.Key) string {
 	t.Helper()
 	sum, ok := k.GitSHA1Sum()

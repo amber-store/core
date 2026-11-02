@@ -217,6 +217,22 @@ func TestReachableKeys_GitRootIsRead(t *testing.T) {
 	}
 }
 
+func TestReachableKeys_ABlobRootIsNotRead(t *testing.T) {
+	b, err := fstree.EncodeBlob([]byte("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := fstree.ReachableKeys(b.Key, func(key.Key) ([]byte, error) {
+		return nil, errors.New("must not be read")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, []key.Key{b.Key}) {
+		t.Errorf("ReachableKeys = %v", got)
+	}
+}
+
 func TestCheckComplete_Git(t *testing.T) {
 	r := newGitRepo(t)
 	get := newCountingGet(r.all()...)
