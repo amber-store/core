@@ -422,8 +422,8 @@ func (s *Store) refreshLocked(rebuild bool) error {
 	for _, g := range s.sealed {
 		switch {
 		case keepSealed[g.id]:
-			if sf, ok := ls.sealed[g.id]; ok {
-				g.path = sf.path // a crashed seal that its adopter has renamed
+			if _, ok := ls.sealed[g.id]; ok {
+				g.renamed.Store(true) // a crashed seal, if this was one, that its adopter has finished
 			}
 		case stable:
 			retire = append(retire, g)

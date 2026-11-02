@@ -158,11 +158,7 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 	tail := s.cfg.sync && size > max(res.durable, int64(len(magicHeader)))
 	if tail {
 		s.fsyncs.Add(1)
-		err := f.Sync()
-		if s.beforeAdoptSync != nil {
-			err = s.beforeAdoptSync()
-		}
-		if err != nil {
+		if err := s.fsync(f); err != nil {
 			s.setFailed(err)
 			f.Close()
 			return false, err
@@ -187,14 +183,15 @@ func (s *Store) adopt(id uint64, path string, minVersion byte) (bool, error) {
 func (s *Store) finishSeal(id uint64, path string, f *os.File) error {
 	defer f.Close()
 	sealedPath := strings.TrimSuffix(path, ".active")
-	err := f.Sync()
-	if err == nil {
-		err = os.Rename(path, sealedPath)
+	if err := s.fsync(f); err != nil {
+		s.setFailed(err)
+		return err
 	}
-	if err == nil {
-		err = s.dirF.Sync()
+	if err := os.Rename(path, sealedPath); err != nil {
+		return err
 	}
-	if err != nil {
+	if err := s.fsync(s.dirF); err != nil {
+		s.setFailed(err)
 		return err
 	}
 	os.Remove(path + sidecarSuffix) // a sealed segment indexes itself
@@ -211,23 +208,24 @@ func (s *Store) finishSeal(id uint64, path string, f *os.File) error {
 // finishCrashedSeal finishes the seal a view holds under its active name, unless
 // somebody else holds it. Called under appendMu.
 func (s *Store) finishCrashedSeal(g *sealedSegment) error {
-	f, err := os.OpenFile(g.path, os.O_RDWR, 0)
+	path := g.file()
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	if ok, err := tryLock(f); err != nil || !ok || !isFileAt(f, g.path) {
+	if ok, err := tryLock(f); err != nil || !ok || !isFileAt(f, path) {
 		f.Close()
 		return err
 	}
-	res, err := recoverSegment(g.path)
+	res, err := recoverSegment(path)
 	if err != nil || !res.sealed {
 		f.Close()
 		return err
 	}
-	return s.finishSeal(g.id, g.path, f)
+	return s.finishSeal(g.id, path, f)
 }
 
 // createActive makes a new active segment with an id above every one in the
@@ -271,13 +269,13 @@ func (s *Store) createActive(maxID uint64) error {
 			continue
 		}
 		if _, err = f.WriteAt(headerAt(s.segVersion), 0); err == nil {
-			err = f.Sync()
+			err = s.fsync(f)
 		}
 		if err == nil {
 			err = os.Rename(tmp, final)
 		}
 		if err == nil {
-			err = s.dirF.Sync()
+			err = s.fsync(s.dirF)
 		}
 		if err != nil {
 			os.Remove(final) // while the lock still holds: nobody may adopt a segment that is on its way out

@@ -106,7 +106,7 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	if found && !damaged {
 		if syncNow && s.cfg.sync && s.active != nil {
 			if _, ok := s.active.index[k]; ok {
-				if err := s.active.f.Sync(); err != nil {
+				if err := s.fsync(s.active.f); err != nil {
 					s.setFailed(err)
 					return err
 				}
@@ -171,7 +171,8 @@ func repairRecord(seg *sealedSegment, e indexEntry) ([]byte, error) {
 func (s *Store) repairSegment(seg *sealedSegment, k key.Key, replacement []byte) error {
 	entries := slices.Collect(seg.fv.allEntries())
 	slices.SortFunc(entries, func(a, b indexEntry) int { return cmp.Compare(a.off, b.off) })
-	temporary := seg.path + ".repair"
+	path := seg.file()
+	temporary := path + ".repair"
 	if err := os.Remove(temporary); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -209,23 +210,23 @@ func (s *Store) repairSegment(seg *sealedSegment, k key.Key, replacement []byte)
 	if _, err := file.Write(footer); err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
+	if err := s.fsync(file); err != nil {
 		return err
 	}
 	ready, err := openSealed(temporary, seg.id)
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, seg.path); err != nil {
+	if err := os.Rename(temporary, path); err != nil {
 		ready.close()
 		return err
 	}
-	if err := s.dirF.Sync(); err != nil {
+	if err := s.fsync(s.dirF); err != nil {
 		ready.close()
 		s.setFailed(err)
 		return err
 	}
-	ready.path = seg.path
+	ready.path = path
 	// The replacement takes seg's place by id. Readers holding mu have
 	// drained; registered mmap walks — this one included — can still use seg,
 	// which is unmapped when the last of them ends. Never wait under

@@ -353,7 +353,7 @@ func TestAFailedAdoptionFsyncPoisonsTheStore(t *testing.T) {
 	dir := killedWriter(t, objs)
 	s := openStore(t, dir)
 	boom := errors.New("boom")
-	s.beforeAdoptSync = func() error { return boom }
+	s.beforeFsync = func(*os.File) error { return boom }
 	if err := s.Put(objs[0].Key, objs[0].Data); !errors.Is(err, boom) {
 		t.Fatalf("Put = %v, want the fsync's error", err)
 	}
@@ -362,7 +362,7 @@ func TestAFailedAdoptionFsyncPoisonsTheStore(t *testing.T) {
 	}
 	// The store stays out of action for writes, as after any failed fsync: the
 	// disk may have dropped what it failed to write, so a retry proves nothing.
-	s.beforeAdoptSync = nil
+	s.beforeFsync = nil
 	if err := s.Put(objs[1].Key, objs[1].Data); !errors.Is(err, boom) {
 		t.Errorf("Put after the failure = %v", err)
 	}

@@ -138,13 +138,13 @@ type Store struct {
 
 	// refreshSeq counts refreshes of the view, so that a lookup that waited
 	// for one does not repeat it; refreshes counts them for tests.
-	refreshMu       sync.Mutex
-	refreshSeq      atomic.Uint64
-	refreshes       atomic.Int64
-	afterList       func()       // test hook: runs when a refresh has listed the directory, before it opens anything
-	afterDetach     func()       // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
-	afterFooter     func() error // test hook: runs when a seal wrote the footer, before it syncs; an error it returns stands in for the write's
-	beforeAdoptSync func() error // test hook: runs before adoption fsyncs a tail; an error it returns stands in for the fsync's
+	refreshMu   sync.Mutex
+	refreshSeq  atomic.Uint64
+	refreshes   atomic.Int64
+	afterList   func()               // test hook: runs when a refresh has listed the directory, before it opens anything
+	afterDetach func()               // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
+	afterFooter func() error         // test hook: runs when a seal wrote the footer, before it syncs; an error it returns stands in for the write's
+	beforeFsync func(*os.File) error // test hook: runs before every fsync (Store.fsync); an error it returns stands in for the fsync's
 
 	gate *gate // gc.lock: writers against a sweep, across processes (gate.go)
 }
@@ -285,7 +285,7 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 			// holds it: the record is already appended. Whoever appended it
 			// may have been a deferred put, which has not synced it.
 			if syncNow && s.cfg.sync && s.deferred.Load() {
-				if err := a.f.Sync(); err != nil {
+				if err := s.fsync(a.f); err != nil {
 					s.setFailed(err)
 					return err
 				}
@@ -322,7 +322,7 @@ func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	a.sc.entry(k, loc) // only now: an entry never precedes its record
 
 	if syncNow && s.cfg.sync {
-		if err := a.f.Sync(); err != nil {
+		if err := s.fsync(a.f); err != nil {
 			s.setFailed(err)
 			return err
 		}
@@ -356,7 +356,7 @@ func (s *Store) syncActive() error {
 		s.deferred.Store(false)
 		return nil
 	}
-	if err := s.active.f.Sync(); err != nil {
+	if err := s.fsync(s.active.f); err != nil {
 		s.setFailed(err)
 		return err
 	}
@@ -364,6 +364,17 @@ func (s *Store) syncActive() error {
 	s.deferred.Store(false)
 	s.fsyncs.Add(1)
 	return nil
+}
+
+// fsync is every fsync the store's durability rests on, so that a test can see each
+// one and fail it. Whoever acknowledges on its strength calls setFailed when it fails.
+func (s *Store) fsync(f *os.File) error {
+	if s.beforeFsync != nil {
+		if err := s.beforeFsync(f); err != nil {
+			return err
+		}
+	}
+	return f.Sync()
 }
 
 // setFailed poisons the write path after an fsync failure: a failed fsync may
@@ -427,14 +438,14 @@ func (s *Store) sealActiveLocked() error {
 
 // finishSealLocked is sealActiveLocked's part after the footer is written.
 func (s *Store) finishSealLocked(a *activeSegment) error {
-	if err := a.f.Sync(); err != nil {
+	if err := s.fsync(a.f); err != nil {
 		return err
 	}
 	sealedPath := strings.TrimSuffix(a.path, ".active")
 	if err := os.Rename(a.path, sealedPath); err != nil {
 		return err
 	}
-	if err := s.dirF.Sync(); err != nil {
+	if err := s.fsync(s.dirF); err != nil {
 		return err
 	}
 	// The footer indexes the segment from here on. A crash before the
@@ -904,10 +915,10 @@ func (s *Store) Wipe() error {
 	}
 	for _, seg := range sealed {
 		note(seg.close())
-		note(os.Remove(seg.path))
+		note(os.Remove(seg.file()))
 	}
 	if s.cfg.sync {
-		note(s.dirF.Sync())
+		note(s.fsync(s.dirF))
 	}
 	return firstErr
 }
@@ -928,11 +939,11 @@ func (s *Store) Close() error {
 	if s.active != nil {
 		// Synced whatever the sync option says, so that a store closed
 		// cleanly always reopens from its sidecar alone.
-		if err := s.active.f.Sync(); err != nil {
+		if err := s.fsync(s.active.f); err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
-		} else {
+		} else if s.failed == nil { // after a failed fsync this one proves nothing
 			s.active.sc.synced(s.active.size)
 		}
 		s.active.sc.close()

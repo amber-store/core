@@ -209,7 +209,7 @@ func (s *Store) Compact(live func(key.Key) bool, opts CompactOpts) (CompactStats
 		return stats, err
 	}
 	if s.cfg.sync && s.active != nil {
-		if err := s.active.f.Sync(); err != nil {
+		if err := s.fsync(s.active.f); err != nil {
 			s.setFailed(err)
 			return stats, err
 		}
@@ -229,7 +229,7 @@ func (s *Store) selectVictims(live func(key.Key) bool, opts CompactOpts, stats *
 	var victims []*sealedSegment
 	for _, g := range segs {
 		if !opts.Horizon.IsZero() {
-			st, err := os.Stat(g.path)
+			st, err := g.stat()
 			if err != nil {
 				return nil, err
 			}
@@ -374,7 +374,7 @@ func (s *Store) removeVictims(victims []*sealedSegment, stats *CompactStats) err
 		}
 	}
 	if s.cfg.sync {
-		if err := s.dirF.Sync(); err != nil && firstErr == nil {
+		if err := s.fsync(s.dirF); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
