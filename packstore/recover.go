@@ -44,17 +44,13 @@ func scanActive(path string) (scanResult, error) {
 	}
 	// A complete footer survives a crash before the seal rename. Trust its
 	// index even when body corruption would stop the prefix scan early.
-	if _, err := parseFooter(b); err == nil {
+	if fv, err := parseFooter(b); err == nil && !insideRecord(b, fv.bodyLen) {
 		res.size, res.sealed = int64(len(b)), true
 		return res, nil
 	}
 	off := int64(len(magicHeader))
 	for off < int64(len(b)) {
 		if b[off] == tagSeal {
-			if _, err := parseFooter(b); err == nil {
-				res.size, res.sealed = int64(len(b)), true
-				return res, nil
-			}
 			// Partial footer: truncate at the seal marker. A valid footer
 			// followed by trailing bytes also lands here (parseFooter anchors
 			// the trailer at EOF); that state cannot arise from our write
@@ -70,4 +66,21 @@ func scanActive(path string) (scanResult, error) {
 	}
 	res.size = off
 	return res, nil
+}
+
+// insideRecord reports whether a footer that starts at bodyLen lies inside a record, which
+// makes it that record's payload: an object is whatever bytes somebody stored, and those
+// may read as a footer that fits where they lie. A seal's footer starts where its last
+// record ends. Damage on the way ends the walk with no answer: the footer stands, since
+// it is what indexes the records behind the damage.
+func insideRecord(b []byte, bodyLen int64) bool {
+	off := int64(len(magicHeader))
+	for off < bodyLen {
+		rec, err := amberpack.ParseRecord(b[off:])
+		if err != nil {
+			return false
+		}
+		off += amberpack.RecHeaderSize + int64(rec.Slen)
+	}
+	return off > bodyLen
 }
