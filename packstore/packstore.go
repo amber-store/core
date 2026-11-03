@@ -141,6 +141,8 @@ type Store struct {
 	refreshMu   sync.Mutex
 	refreshSeq  atomic.Uint64
 	refreshes   atomic.Int64
+	kept        map[uint64]bool      // segments the last Compact left in place; under appendMu
+	copying     bool                 // a Compact is copying survivors, and takes no segment from anybody (ensureActiveLocked); under appendMu
 	afterList   func()               // test hook: runs when a refresh has listed the directory, before it opens anything
 	afterDetach func()               // test hook: runs when Compact or Remove took its victims out of the view, before it unlinks them
 	afterFooter func() error         // test hook: runs when a seal wrote the footer, before it syncs; an error it returns stands in for the write's
@@ -632,6 +634,39 @@ func (s *Store) get(k key.Key) ([]byte, error) {
 		}
 	}
 	return nil, ErrNotFound
+}
+
+// GetVerified is Get, and checks that the bytes it read hash to the key. Get trusts
+// them, which is what a read of file content can afford. A walk that decides what is
+// alive cannot: a bad directory can still decode, and walks as a smaller one (a
+// collector's mark, and a reference's completeness check). A payload that decodes and
+// hashes to something else wraps both ErrCorrupt and ErrVerify; one that does not even
+// decode fails as it does for Get. What a key's length says is for whoever reads the
+// object: a commit keyed by an older rule is told apart by the walk, which says what to
+// do about it (fstree's decodeCommit).
+//
+// A failure gets one more try on a fresh view: a repair replaces a segment under its
+// name and moves no generation, so another store's may be what this one has yet to see.
+func (s *Store) GetVerified(k key.Key) ([]byte, error) {
+	data, err := s.getVerified(k)
+	if err == nil || errors.Is(err, ErrNotFound) || errors.Is(err, ErrClosed) {
+		return data, err
+	}
+	if s.refresh() != nil {
+		return nil, err // what the read found says more than why it could not look again
+	}
+	return s.getVerified(k)
+}
+
+func (s *Store) getVerified(k key.Key) ([]byte, error) {
+	data, err := s.Get(k)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyHash(k, data); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCorrupt, err)
+	}
+	return data, nil
 }
 
 // GetRecord returns a caller-owned copy of the full on-disk record stored under

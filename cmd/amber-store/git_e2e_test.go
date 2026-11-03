@@ -1,10 +1,13 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/amber-store/core/amberpack"
 	"github.com/amber-store/core/gitobj"
 	"github.com/amber-store/core/key"
 	"github.com/amber-store/core/packstore"
@@ -131,5 +134,63 @@ func TestE2E_RefSetChecksGitCompleteness(t *testing.T) {
 	}
 	if _, err := runApp(t, "--store", store, "ref", "set", "partial", shallow.String()); err == nil {
 		t.Error("ref set accepted a commit whose tree is not in the store")
+	}
+}
+
+// A cycle that left a pack behind says what it did do, and fails.
+func TestE2E_GCRunReportsWhatABadRecordKept(t *testing.T) {
+	store := t.TempDir()
+	seg := []string{"--store", store, "--segment-size", "2048"}
+	objects, err := packstore.Open(filepath.Join(store, "packstore"), packstore.WithSegmentSize(2048))
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(kind gitobj.Kind, body string) key.Key {
+		t.Helper()
+		data := gitobj.Encode(kind, []byte(body))
+		k, err := gitobj.KeyOf(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := objects.PutVerified(k, data); err != nil {
+			t.Fatal(err)
+		}
+		return k
+	}
+	blob := put(gitobj.Blob, "hello\n")
+	sum, _ := blob.GitSHA1Sum()
+	top := put(gitobj.Tree, "100644 f\x00"+string(sum[:]))
+	for i := range 40 {
+		put(gitobj.Blob, strings.Repeat("x", 400)+string(rune('a'+i)))
+	}
+	if err := objects.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runApp(t, append(seg, "ref", "set", "main", top.String())...); err != nil {
+		t.Fatalf("ref set: %v", err)
+	}
+	// The blob is the first record of the first pack.
+	p := filepath.Join(store, "packstore", "0000000000000001.seg")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[8+amberpack.RecHeaderSize] ^= 0x40
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	out, err := runApp(t, append(seg, "gc", "run", "--grace", "1ms", "--garbage", "0")...)
+	if err == nil {
+		t.Fatalf("gc run passed a bad record: %q", out)
+	}
+	if !strings.Contains(err.Error(), blob.String()) || !strings.Contains(err.Error(), "PutVerified") {
+		t.Errorf("the error does not say what to do: %v", err)
+	}
+	if !strings.Contains(out, " reaped,") || !strings.Contains(out, "1 left in place") {
+		t.Errorf("gc run said %q, want what it did and what it left", out)
+	}
+	if strings.Contains(out, " 0 reaped,") {
+		t.Errorf("gc run freed nothing: %q", out)
 	}
 }

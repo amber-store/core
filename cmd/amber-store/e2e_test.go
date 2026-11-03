@@ -557,8 +557,8 @@ func TestE2E_CommitKeyedByTheOldRuleIsRefused(t *testing.T) {
 		{"ref", "set", "old", old.String()},
 		{"ls", old.String()},
 	} {
-		if out, err := run(args...); err == nil || !strings.Contains(err.Error(), "footprint") {
-			t.Errorf("%v = %q, %v; want an error that names the footprint rule", args, out, err)
+		if out, err := run(args...); err == nil || !strings.Contains(err.Error(), "a commit keyed by an older rule has to be created again") {
+			t.Errorf("%v = %q, %v; want an error that says what to do about it", args, out, err)
 		}
 	}
 }

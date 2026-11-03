@@ -299,7 +299,9 @@ the directory; from then on its view is complete and stable. Its mark set
 covers every active segment it can see, not only its own. The sweep seals the
 collector's own active segment and every one it can adopt, so that a small
 store, whose segments never fill, still gets collected; a segment a live
-writer holds is left alone, and an active segment is never a victim.
+writer holds is left alone, and is no victim. (A crashed seal is a sealed
+segment under its active name, and can be one, whoever holds it: its holder
+has failed, and writes nothing more to it.)
 
 Objects written by another process and not yet named by a reference when a
 cycle starts are protected by the grace period alone. (git has a second
@@ -334,7 +336,10 @@ above:
   the first span, as [above](#the-gate-writers-against-a-sweep).
 - **Survivors are durable before victims are unlinked**: a compaction syncs
   the segment it copied into, then removes the old ones, then syncs the
-  directory.
+  directory. A copy stands in for a victim's only if it verifies, or the pass copied
+  it itself, which is why a pass takes over no segment while it copies: one somebody
+  left in the meantime holds what nobody verified, and may be a crashed seal the pass
+  is reading, which finishing would unmap.
 - **Rely only on durable copies** when skipping a write or a survivor's copy. That
   covers what a segment's own writer holds in its index: fsync an adopted segment's
   unsynced tail before acknowledging anything against it.
