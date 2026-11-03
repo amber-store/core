@@ -464,3 +464,15 @@ func TestARepairLeavesACrashedSealSomebodyHolds(t *testing.T) {
 		t.Fatalf("Get = %d bytes, %v", len(got), err)
 	}
 }
+
+// The exported form of the same check: "a copy somewhere else" must be one that can stand
+// in for this one.
+func TestHasOutsideDoesNotRelyOnACrashedSeal(t *testing.T) {
+	objs := testObjects(t, 2)
+	dir, _ := crashedSealIn(t, objs[:1])
+	sealedFile(t, dir, 7, objs[0], objs[1])
+	s := openStore(t, dir)
+	if has, err := s.HasOutside(7, objs[0].Key); err != nil || has {
+		t.Fatalf("HasOutside = %v, %v; the only copy outside segment 7 is in a crashed seal nobody has fsynced", has, err)
+	}
+}

@@ -167,7 +167,7 @@ func (s *Store) HasOutside(id uint64, k key.Key) (bool, error) {
 		if s.sealed[i].id == id {
 			continue
 		}
-		if s.sealed[i].has(k) {
+		if s.reliableSealed(s.sealed[i], k) {
 			return true, nil
 		}
 	}

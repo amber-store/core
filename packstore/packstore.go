@@ -463,8 +463,8 @@ func (s *Store) finishSealLocked(a *activeSegment) error {
 	// Close the fd only after the swap: in-flight readers hold mu.RLock for
 	// their whole pread, so the Lock above drained them, and post-swap
 	// readers route to the sealed mmap. A close error fails the triggering
-	// Put even though the object is sealed and durable — harmless; a retried
-	// Put dedups via Has.
+	// Put, and poisons the store (sealActiveLocked), though the object is
+	// sealed and durable: the next open finds it.
 	return a.f.Close()
 }
 
@@ -795,12 +795,18 @@ func (s *Store) hasDurably(k key.Key) (bool, error) {
 		return true, nil
 	}
 	for i := len(s.sealed) - 1; i >= 0; i-- {
-		g := s.sealed[i]
-		if g.has(k) && (!s.cfg.sync || !g.crashedSeal()) {
+		if s.reliableSealed(s.sealed[i], k) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// reliableSealed reports whether g holds a copy of k that a write, or a compaction, may
+// rely on instead of making its own: not one in a crashed seal, when this store syncs,
+// since nobody has fsynced that yet (crashedSeal).
+func (s *Store) reliableSealed(g *sealedSegment, k key.Key) bool {
+	return g.has(k) && (!s.cfg.sync || !g.crashedSeal())
 }
 
 // reliableActiveLocked reports whether an active segment holds a copy of k
