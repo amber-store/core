@@ -76,7 +76,7 @@ func (s *Store) Segments() ([]SegmentInfo, error) {
 	}
 	out := make([]SegmentInfo, 0, len(s.sealed))
 	for _, g := range s.sealed {
-		st, err := os.Stat(g.path)
+		st, err := g.stat()
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +167,7 @@ func (s *Store) HasOutside(id uint64, k key.Key) (bool, error) {
 		if s.sealed[i].id == id {
 			continue
 		}
-		if s.sealed[i].has(k) {
+		if s.reliableSealed(s.sealed[i], k) {
 			return true, nil
 		}
 	}
@@ -253,9 +253,9 @@ func (s *Store) Remove(id uint64) error {
 	if s.afterDetach != nil {
 		s.afterDetach()
 	}
-	firstErr := os.Remove(seg.path)
+	firstErr := os.Remove(seg.file())
 	if s.cfg.sync {
-		if err := s.dirF.Sync(); err != nil && firstErr == nil {
+		if err := s.fsync(s.dirF); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

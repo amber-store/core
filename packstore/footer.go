@@ -3,12 +3,16 @@ package packstore
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
+	"io/fs"
 	"math"
 	"os"
 	"slices"
 	"sort"
+	"strings"
+	"sync/atomic"
 
 	"github.com/FastFilter/xorfilter"
 	"github.com/amber-store/core/amberpack"
@@ -325,10 +329,40 @@ func (fv *footerView) lookupPos(k key.Key) (pos int, ok bool) {
 // sealedSegment is an immutable, fully mmap'd segment.
 type sealedSegment struct {
 	id   uint64
-	path string
+	path string      // the name it was mapped under, for messages; file says where it is now
 	fi   os.FileInfo // which file this is: a repair replaces a segment under its name, and an id can come back
 	mm   []byte
 	fv   *footerView
+	// renamed says that a crashed seal has its sealed name now: whoever held it has
+	// finished it, which a refresh finds out while others are reading.
+	renamed atomic.Bool
+}
+
+// crashedSeal reports whether this is a seal whose writer died before the rename,
+// mapped as the sealed segment it is about to be. Its body may never have been
+// fsynced: only the fsync that comes with finishing the seal (adopt) says it has, so
+// a store that syncs must not acknowledge a write against it.
+func (g *sealedSegment) crashedSeal() bool {
+	return strings.HasSuffix(g.path, activeSuffix) && !g.renamed.Load()
+}
+
+// file is where the segment is now, as far as this view knows.
+func (g *sealedSegment) file() string {
+	if g.renamed.Load() {
+		return strings.TrimSuffix(g.path, ".active")
+	}
+	return g.path
+}
+
+// stat looks at the segment's file. A crashed seal that is gone from its active name
+// has been finished by whoever held it, which the view hears of at its next refresh.
+func (g *sealedSegment) stat() (os.FileInfo, error) {
+	st, err := os.Stat(g.file())
+	if errors.Is(err, fs.ErrNotExist) && g.crashedSeal() {
+		g.renamed.Store(true)
+		return os.Stat(g.file())
+	}
+	return st, err
 }
 
 // openSealed maps a sealed segment and validates its footer. The fd is closed

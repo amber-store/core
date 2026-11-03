@@ -25,6 +25,25 @@ func (s *Store) PutVerifiedDeferred(k key.Key, data []byte) error {
 	return s.putVerified(k, data, false)
 }
 
+// finishCrashedSeals finishes every crashed seal in the view that holds k. Called
+// under appendMu.
+func (s *Store) finishCrashedSeals(k key.Key) error {
+	s.mu.RLock()
+	var crashed []*sealedSegment
+	for _, g := range s.sealed {
+		if g.crashedSeal() && g.has(k) {
+			crashed = append(crashed, g)
+		}
+	}
+	s.mu.RUnlock()
+	for _, g := range crashed {
+		if err := s.finishCrashedSeal(g); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	if err := verifyObject(Object{Key: k, Data: data}); err != nil {
 		return err
@@ -58,6 +77,13 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 			damaged = !validRepairRecord(k, raw)
 		}
 	}
+	// A seal whose writer crashed may never have been fsynced: finish it, so that
+	// what it holds can be relied on, or repaired, like any other segment's.
+	if s.cfg.sync {
+		if err := s.finishCrashedSeals(k); err != nil {
+			return err
+		}
+	}
 	// The view can change under a refresh, which takes no appendMu: walk a
 	// snapshot, registered as a scrub so that nothing in it is unmapped.
 	s.mu.RLock()
@@ -66,6 +92,9 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	s.mu.RUnlock()
 	defer s.endScrub()
 	for _, seg := range sealed {
+		if s.cfg.sync && seg.crashedSeal() {
+			continue // somebody else holds it, and is finishing it: not a copy to rely on yet
+		}
 		if off, slen, ok := seg.fv.lookup(k); ok {
 			found = true
 			raw, err := repairRecord(seg, indexEntry{k: k, off: off, slen: slen})
@@ -77,7 +106,7 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	if found && !damaged {
 		if syncNow && s.cfg.sync && s.active != nil {
 			if _, ok := s.active.index[k]; ok {
-				if err := s.active.f.Sync(); err != nil {
+				if err := s.fsync(s.active.f); err != nil {
 					s.setFailed(err)
 					return err
 				}
@@ -107,6 +136,9 @@ func (s *Store) putVerified(k key.Key, data []byte, syncNow bool) error {
 	sealed = slices.Clone(s.sealed) // again: it now holds what was the active segment
 	s.mu.RUnlock()
 	for _, seg := range sealed {
+		if s.cfg.sync && seg.crashedSeal() {
+			continue // somebody else's to finish, and not this store's to rewrite
+		}
 		damaged := false
 		if off, slen, ok := seg.fv.lookup(k); ok {
 			raw, err := repairRecord(seg, indexEntry{k: k, off: off, slen: slen})
@@ -139,7 +171,8 @@ func repairRecord(seg *sealedSegment, e indexEntry) ([]byte, error) {
 func (s *Store) repairSegment(seg *sealedSegment, k key.Key, replacement []byte) error {
 	entries := slices.Collect(seg.fv.allEntries())
 	slices.SortFunc(entries, func(a, b indexEntry) int { return cmp.Compare(a.off, b.off) })
-	temporary := seg.path + ".repair"
+	path := seg.file()
+	temporary := path + ".repair"
 	if err := os.Remove(temporary); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -177,23 +210,23 @@ func (s *Store) repairSegment(seg *sealedSegment, k key.Key, replacement []byte)
 	if _, err := file.Write(footer); err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
+	if err := s.fsync(file); err != nil {
 		return err
 	}
 	ready, err := openSealed(temporary, seg.id)
 	if err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, seg.path); err != nil {
+	if err := os.Rename(temporary, path); err != nil {
 		ready.close()
 		return err
 	}
-	if err := s.dirF.Sync(); err != nil {
+	if err := s.fsync(s.dirF); err != nil {
 		ready.close()
 		s.setFailed(err)
 		return err
 	}
-	ready.path = seg.path
+	ready.path = path
 	// The replacement takes seg's place by id. Readers holding mu have
 	// drained; registered mmap walks — this one included — can still use seg,
 	// which is unmapped when the last of them ends. Never wait under
